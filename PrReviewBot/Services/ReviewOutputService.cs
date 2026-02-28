@@ -102,14 +102,14 @@ public class ReviewOutputService
 
             if (primaryComments.Count != 0)
             {
-                AppendCommentGroup(sb, primaryComments);
+                AppendCommentGroup(sb, primaryComments, isAdditional: false);
             }
 
             if (additionalComments.Count != 0)
             {
                 sb.AppendLine("## 💡 Additional Observations (outside PR changes)");
                 sb.AppendLine();
-                AppendCommentGroup(sb, additionalComments);
+                AppendCommentGroup(sb, additionalComments, isAdditional: true);
             }
         }
 
@@ -225,8 +225,10 @@ public class ReviewOutputService
         return result.ToString().Trim('-');
     }
 
-    private static void AppendCommentGroup(StringBuilder sb, IEnumerable<ReviewComment> items)
+    private static void AppendCommentGroup(StringBuilder sb, IEnumerable<ReviewComment> items, bool isAdditional)
     {
+        string scopeTag = isAdditional ? "`[Optional]`" : "`[PR Change]`";
+
         foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
         {
             sb.AppendLine(CultureInfo.InvariantCulture, $"### 📄 `{fileGroup.Key}`");
@@ -245,7 +247,7 @@ public class ReviewOutputService
                     ? $" — Line {comment.LineNumber}"
                     : "";
 
-                sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo}");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo} {scopeTag}");
                 sb.AppendLine();
                 sb.AppendLine(CultureInfo.InvariantCulture, $"**Issue:** {comment.Issue}");
                 sb.AppendLine();
