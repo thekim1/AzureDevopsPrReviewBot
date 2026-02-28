@@ -22,6 +22,11 @@ public class AzureDevOpsService
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
         List<GitRepository> repos = await gitClient.GetRepositoriesAsync(_settings.Project);
+
+        // Filter out disabled repositories — they are returned by GetRepositoriesAsync
+        // but throw TF401019 when used in subsequent API calls like GetPullRequestsAsync
+        repos = repos.Where(r => r.IsDisabled != true).ToList();
+
         List<PullRequestInfo> result = new List<PullRequestInfo>();
 
         Guid reviewerId = await GetCurrentUserIdAsync();
