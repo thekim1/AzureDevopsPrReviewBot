@@ -10,6 +10,8 @@ namespace PrReviewBot.Services;
 
 public class AzureDevOpsService
 {
+    private const string RefsHeadsPrefix = "refs/heads/";
+
     private readonly AzureDevOpsSettings _settings;
     private readonly VssConnection _connection;
 
@@ -54,8 +56,8 @@ public class AzureDevOpsService
                     Title = pr.Title,
                     Description = pr.Description ?? "",
                     Author = pr.CreatedBy.DisplayName,
-                    SourceBranch = pr.SourceRefName.Replace("refs/heads/", ""),
-                    TargetBranch = pr.TargetRefName.Replace("refs/heads/", ""),
+                    SourceBranch = pr.SourceRefName.Replace(RefsHeadsPrefix, ""),
+                    TargetBranch = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
                     RepositoryName = repo.Name,
                     RepositoryId = repo.Id.ToString(),
                     ChangedFiles = changes,
@@ -127,7 +129,7 @@ public class AzureDevOpsService
             {
                 GitVersionDescriptor sourceVersion = new()
                 {
-                    Version = pr.SourceRefName.Replace("refs/heads/", ""),
+                    Version = pr.SourceRefName.Replace(RefsHeadsPrefix, ""),
                     VersionType = GitVersionType.Branch
                 };
                 newContent = await ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
@@ -137,7 +139,7 @@ public class AzureDevOpsService
             {
                 GitVersionDescriptor targetVersion = new()
                 {
-                    Version = pr.TargetRefName.Replace("refs/heads/", ""),
+                    Version = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
                     VersionType = GitVersionType.Branch
                 };
                 oldContent = await ReadStreamAsync(gitClient, repoId, filePath, targetVersion);

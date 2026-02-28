@@ -31,43 +31,6 @@ public class ReviewOutputService
         List<ReviewComment> primaryComments = [.. comments.Where(c => !c.IsAdditionalObservation)];
         List<ReviewComment> additionalComments = [.. comments.Where(c => c.IsAdditionalObservation)];
 
-        static void RenderCommentGroup(IEnumerable<ReviewComment> items)
-        {
-            foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
-            {
-                AnsiConsole.MarkupLine($"\n[bold yellow]📄 {fileGroup.Key}[/]");
-
-                foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
-                {
-                    string color = comment.Severity switch
-                    {
-                        CommentSeverity.Critical => "red",
-                        CommentSeverity.Warning => "yellow",
-                        _ => "blue"
-                    };
-                    string icon = comment.Severity switch
-                    {
-                        CommentSeverity.Critical => "🔴",
-                        CommentSeverity.Warning => "🟡",
-                        _ => "🔵"
-                    };
-
-                    string lineInfo = comment.LineNumber.HasValue ? $" (line {comment.LineNumber})" : "";
-                    AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]: {Markup.Escape(comment.Issue)}");
-                    AnsiConsole.MarkupLine($"  [grey]{Markup.Escape(comment.Suggestion)}[/]");
-
-                    if (!string.IsNullOrWhiteSpace(comment.CodeExample))
-                    {
-                        AnsiConsole.Write(new Panel(
-                            new Markup($"[green]{Markup.Escape(comment.CodeExample)}[/]"))
-                            .Header("Suggested Code")
-                            .BorderColor(Color.Green)
-                            .Padding(1, 0));
-                    }
-                }
-            }
-        }
-
         if (primaryComments.Count != 0)
         {
             AnsiConsole.Write(new Rule("[bold]Review of PR Changes[/]").LeftJustified());
@@ -137,61 +100,16 @@ public class ReviewOutputService
             List<ReviewComment> primaryComments = [.. comments.Where(c => !c.IsAdditionalObservation)];
             List<ReviewComment> additionalComments = [.. comments.Where(c => c.IsAdditionalObservation)];
 
-            void AppendCommentGroup(IEnumerable<ReviewComment> items)
-            {
-                foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
-                {
-                    sb.AppendLine(CultureInfo.InvariantCulture, $"### 📄 `{fileGroup.Key}`");
-                    sb.AppendLine();
-
-                    foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
-                    {
-                        string icon = comment.Severity switch
-                        {
-                            CommentSeverity.Critical => "🔴 Critical",
-                            CommentSeverity.Warning => "🟡 Warning",
-                            _ => "🔵 Info"
-                        };
-
-                        string lineInfo = comment.LineNumber.HasValue
-                            ? $" — Line {comment.LineNumber}"
-                            : "";
-
-                        sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo}");
-                        sb.AppendLine();
-                        sb.AppendLine(CultureInfo.InvariantCulture, $"**Issue:** {comment.Issue}");
-                        sb.AppendLine();
-                        sb.AppendLine(CultureInfo.InvariantCulture, $"{comment.Suggestion}");
-
-                        if (!string.IsNullOrWhiteSpace(comment.CodeExample))
-                        {
-                            sb.AppendLine();
-                            sb.AppendLine("**Suggested change:**");
-                            sb.AppendLine();
-
-                            string lang = GetLanguageHint(fileGroup.Key);
-                            sb.AppendLine(CultureInfo.InvariantCulture, $"```{lang}");
-                            sb.AppendLine(comment.CodeExample.TrimEnd());
-                            sb.AppendLine("```");
-                        }
-
-                        sb.AppendLine();
-                        sb.AppendLine("---");
-                        sb.AppendLine();
-                    }
-                }
-            }
-
             if (primaryComments.Count != 0)
             {
-                AppendCommentGroup(primaryComments);
+                AppendCommentGroup(sb, primaryComments);
             }
 
             if (additionalComments.Count != 0)
             {
                 sb.AppendLine("## 💡 Additional Observations (outside PR changes)");
                 sb.AppendLine();
-                AppendCommentGroup(additionalComments);
+                AppendCommentGroup(sb, additionalComments);
             }
         }
 
@@ -226,6 +144,43 @@ public class ReviewOutputService
         sb.AppendLine("*— AI Review Bot*");
 
         return sb.ToString();
+    }
+
+    private static void RenderCommentGroup(IEnumerable<ReviewComment> items)
+    {
+        foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
+        {
+            AnsiConsole.MarkupLine($"\n[bold yellow]📄 {fileGroup.Key}[/]");
+
+            foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
+            {
+                string color = comment.Severity switch
+                {
+                    CommentSeverity.Critical => "red",
+                    CommentSeverity.Warning => "yellow",
+                    _ => "blue"
+                };
+                string icon = comment.Severity switch
+                {
+                    CommentSeverity.Critical => "🔴",
+                    CommentSeverity.Warning => "🟡",
+                    _ => "🔵"
+                };
+
+                string lineInfo = comment.LineNumber.HasValue ? $" (line {comment.LineNumber})" : "";
+                AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]: {Markup.Escape(comment.Issue)}");
+                AnsiConsole.MarkupLine($"  [grey]{Markup.Escape(comment.Suggestion)}[/]");
+
+                if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                {
+                    AnsiConsole.Write(new Panel(
+                        new Markup($"[green]{Markup.Escape(comment.CodeExample)}[/]"))
+                        .Header("Suggested Code")
+                        .BorderColor(Color.Green)
+                        .Padding(1, 0));
+                }
+            }
+        }
     }
 
     private static string BuildFileName(PullRequestInfo pr)
@@ -268,6 +223,51 @@ public class ReviewOutputService
         }
 
         return result.ToString().Trim('-');
+    }
+
+    private static void AppendCommentGroup(StringBuilder sb, IEnumerable<ReviewComment> items)
+    {
+        foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"### 📄 `{fileGroup.Key}`");
+            sb.AppendLine();
+
+            foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
+            {
+                string icon = comment.Severity switch
+                {
+                    CommentSeverity.Critical => "🔴 Critical",
+                    CommentSeverity.Warning => "🟡 Warning",
+                    _ => "🔵 Info"
+                };
+
+                string lineInfo = comment.LineNumber.HasValue
+                    ? $" — Line {comment.LineNumber}"
+                    : "";
+
+                sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo}");
+                sb.AppendLine();
+                sb.AppendLine(CultureInfo.InvariantCulture, $"**Issue:** {comment.Issue}");
+                sb.AppendLine();
+                sb.AppendLine(CultureInfo.InvariantCulture, $"{comment.Suggestion}");
+
+                if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                {
+                    sb.AppendLine();
+                    sb.AppendLine("**Suggested change:**");
+                    sb.AppendLine();
+
+                    string lang = GetLanguageHint(fileGroup.Key);
+                    sb.AppendLine(CultureInfo.InvariantCulture, $"```{lang}");
+                    sb.AppendLine(comment.CodeExample.TrimEnd());
+                    sb.AppendLine("```");
+                }
+
+                sb.AppendLine();
+                sb.AppendLine("---");
+                sb.AppendLine();
+            }
+        }
     }
 
     private static string GetLanguageHint(string filePath) =>

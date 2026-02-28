@@ -35,7 +35,7 @@ public class ClaudeReviewService
         {
             Model = _settings.Model,
             MaxTokens = 4096,
-            System = GetSystemPrompt(),
+            System = SystemPrompt,
             Messages =
             [
                 new()
@@ -56,7 +56,7 @@ public class ClaudeReviewService
         return ParseReviewResponse(content);
     }
 
-    private static string GetSystemPrompt() => """
+    private const string SystemPrompt = """
         You are an expert code reviewer specializing in:
         - .NET 8, .NET 9, .NET 10 (C#, ASP.NET Core, minimal APIs, EF Core)
         - Vue 3 with TypeScript (Composition API, Pinia, Vue Router)
