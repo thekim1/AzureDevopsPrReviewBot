@@ -1,10 +1,11 @@
-﻿using Anthropic;
-using Anthropic.Models.Messages;
-using PrReviewBot.Config;
-using PrReviewBot.Models;
+﻿using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using Anthropic;
+using Anthropic.Models.Messages;
+using PrReviewBot.Config;
+using PrReviewBot.Models;
 
 namespace PrReviewBot.Services;
 
@@ -30,7 +31,7 @@ public class ClaudeReviewService
     {
         string prompt = BuildReviewPrompt(pr);
 
-        MessageCreateParams parameters = new MessageCreateParams
+        MessageCreateParams parameters = new()
         {
             Model = _settings.Model,
             MaxTokens = 4096,
@@ -45,7 +46,7 @@ public class ClaudeReviewService
             ]
         };
 
-        var response = await _client.Messages.Create(parameters);
+        Message response = await _client.Messages.Create(parameters);
 
         string content = response.Content
             .Select(b => b.Value)
@@ -65,6 +66,19 @@ public class ClaudeReviewService
         Your reviews are practical and constructive. You provide specific, actionable feedback
         with corrected code examples. You focus on real issues, not nitpicks.
 
+        The input is in unified diff format. Each line is prefixed with:
+        - `+` : line added in this PR
+        - `-` : line removed in this PR
+        - ` ` (space): unchanged context line
+
+        PRIMARY REVIEW: Focus exclusively on lines starting with `+` or `-`. Only comment on
+        unchanged context lines if they contain a critical bug that directly interacts with the changes.
+        Set "isAdditionalObservation": false for these comments.
+
+        ADDITIONAL OBSERVATIONS: You may also flag genuine issues found in unchanged context lines
+        (lines starting with a space). Set "isAdditionalObservation": true for these. Only include
+        significant issues, not nitpicks.
+
         Always respond with a JSON array of review comments in this exact format:
         [
           {
@@ -73,7 +87,8 @@ public class ClaudeReviewService
             "severity": "Warning",
             "issue": "Brief description of the problem",
             "suggestion": "Explanation of what to do instead",
-            "codeExample": "// corrected code here\npublic async Task<IResult> GetUser(int id) ..."
+            "codeExample": "// corrected code here\npublic async Task<IResult> GetUser(int id) ...",
+            "isAdditionalObservation": false
           }
         ]
 
@@ -87,18 +102,22 @@ public class ClaudeReviewService
 
     private static string BuildReviewPrompt(PullRequestInfo pr)
     {
-        StringBuilder sb = new StringBuilder();
+        StringBuilder sb = new();
         sb.AppendLine($"Review this Pull Request:");
-        sb.AppendLine($"Title: {pr.Title}");
-        sb.AppendLine($"Author: {pr.Author}");
-        sb.AppendLine($"Branch: {pr.SourceBranch} → {pr.TargetBranch}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"Title: {pr.Title}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"Author: {pr.Author}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"Branch: {pr.SourceBranch} → {pr.TargetBranch}");
         if (!string.IsNullOrWhiteSpace(pr.Description))
-            sb.AppendLine($"Description: {pr.Description}");
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"Description: {pr.Description}");
+        }
+
         sb.AppendLine();
 
-        foreach (var file in pr.ChangedFiles)
+        foreach (ChangedFile file in pr.ChangedFiles)
         {
-            sb.AppendLine($"=== FILE: {file.Path} ({file.ChangeType}) ===");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"=== FILE: {file.Path} ({file.ChangeType}) ===");
+            sb.AppendLine("(+ = added, - = removed, space = unchanged context)");
             sb.AppendLine(file.Diff);
             sb.AppendLine();
         }
@@ -116,7 +135,9 @@ public class ClaudeReviewService
                 int start = json.IndexOf('[');
                 int end = json.LastIndexOf(']');
                 if (start >= 0 && end > start)
+                {
                     json = json[start..(end + 1)];
+                }
             }
 
             return JsonSerializer.Deserialize<List<ReviewComment>>(json, _jsonOptions) ?? [];

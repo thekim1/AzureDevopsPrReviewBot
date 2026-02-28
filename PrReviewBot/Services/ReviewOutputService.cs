@@ -1,6 +1,7 @@
-﻿using PrReviewBot.Models;
-using Spectre.Console;
+﻿using System.Globalization;
 using System.Text;
+using PrReviewBot.Models;
+using Spectre.Console;
 
 namespace PrReviewBot.Services;
 
@@ -14,53 +15,70 @@ public class ReviewOutputService
         Directory.CreateDirectory(_outputDirectory);
     }
 
-    public void DisplayReview(PullRequestInfo pr, List<ReviewComment> comments)
+    public static void DisplayReview(PullRequestInfo pr, List<ReviewComment> comments)
     {
         AnsiConsole.Write(new Rule($"[bold blue]PR #{pr.Id}: {pr.Title}[/]").LeftJustified());
         AnsiConsole.MarkupLine($"[grey]Author: {pr.Author} | {pr.SourceBranch} → {pr.TargetBranch}[/]");
         AnsiConsole.MarkupLine($"[grey]URL: {pr.Url}[/]");
         AnsiConsole.WriteLine();
 
-        if (!comments.Any())
+        if (comments.Count == 0)
         {
             AnsiConsole.MarkupLine("[green]✓ No issues found — looks good![/]");
             return;
         }
 
-        IEnumerable<IGrouping<string, ReviewComment>> grouped = comments.GroupBy(c => c.FilePath);
+        List<ReviewComment> primaryComments = [.. comments.Where(c => !c.IsAdditionalObservation)];
+        List<ReviewComment> additionalComments = [.. comments.Where(c => c.IsAdditionalObservation)];
 
-        foreach (IGrouping<string, ReviewComment> fileGroup in grouped)
+        static void RenderCommentGroup(IEnumerable<ReviewComment> items)
         {
-            AnsiConsole.MarkupLine($"\n[bold yellow]📄 {fileGroup.Key}[/]");
-
-            foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
+            foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
             {
-                string color = comment.Severity switch
-                {
-                    CommentSeverity.Critical => "red",
-                    CommentSeverity.Warning => "yellow",
-                    _ => "blue"
-                };
-                string icon = comment.Severity switch
-                {
-                    CommentSeverity.Critical => "🔴",
-                    CommentSeverity.Warning => "🟡",
-                    _ => "🔵"
-                };
+                AnsiConsole.MarkupLine($"\n[bold yellow]📄 {fileGroup.Key}[/]");
 
-                string lineInfo = comment.LineNumber.HasValue ? $" (line {comment.LineNumber})" : "";
-                AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]: {Markup.Escape(comment.Issue)}");
-                AnsiConsole.MarkupLine($"  [grey]{Markup.Escape(comment.Suggestion)}[/]");
-
-                if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
                 {
-                    AnsiConsole.Write(new Panel(
-                        new Markup($"[green]{Markup.Escape(comment.CodeExample)}[/]"))
-                        .Header("Suggested Code")
-                        .BorderColor(Color.Green)
-                        .Padding(1, 0));
+                    string color = comment.Severity switch
+                    {
+                        CommentSeverity.Critical => "red",
+                        CommentSeverity.Warning => "yellow",
+                        _ => "blue"
+                    };
+                    string icon = comment.Severity switch
+                    {
+                        CommentSeverity.Critical => "🔴",
+                        CommentSeverity.Warning => "🟡",
+                        _ => "🔵"
+                    };
+
+                    string lineInfo = comment.LineNumber.HasValue ? $" (line {comment.LineNumber})" : "";
+                    AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]: {Markup.Escape(comment.Issue)}");
+                    AnsiConsole.MarkupLine($"  [grey]{Markup.Escape(comment.Suggestion)}[/]");
+
+                    if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                    {
+                        AnsiConsole.Write(new Panel(
+                            new Markup($"[green]{Markup.Escape(comment.CodeExample)}[/]"))
+                            .Header("Suggested Code")
+                            .BorderColor(Color.Green)
+                            .Padding(1, 0));
+                    }
                 }
             }
+        }
+
+        if (primaryComments.Count != 0)
+        {
+            AnsiConsole.Write(new Rule("[bold]Review of PR Changes[/]").LeftJustified());
+            RenderCommentGroup(primaryComments);
+        }
+
+        if (additionalComments.Count != 0)
+        {
+            AnsiConsole.WriteLine();
+            AnsiConsole.Write(new Rule("[bold grey]💡 Additional Observations (outside PR changes)[/]").LeftJustified());
+            RenderCommentGroup(additionalComments);
         }
 
         int criticalCount = comments.Count(c => c.Severity == CommentSeverity.Critical);
@@ -74,22 +92,22 @@ public class ReviewOutputService
         string fileName = BuildFileName(pr);
         string filePath = Path.Combine(_outputDirectory, fileName);
 
-        var sb = new StringBuilder();
+        StringBuilder sb = new();
 
         // Header
-        sb.AppendLine($"# PR Review: {pr.Title}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"# PR Review: {pr.Title}");
         sb.AppendLine();
-        sb.AppendLine($"- **Date:**       {DateTime.Now:yyyy-MM-dd HH:mm}");
-        sb.AppendLine($"- **Repository:** {pr.RepositoryName}");
-        sb.AppendLine($"- **PR #:**       {pr.Id}");
-        sb.AppendLine($"- **Author:**     {pr.Author}");
-        sb.AppendLine($"- **Branch:**     {pr.SourceBranch} → {pr.TargetBranch}");
-        sb.AppendLine($"- **URL:**        {pr.Url}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **Date:**       {DateTime.Now:yyyy-MM-dd HH:mm}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **Repository:** {pr.RepositoryName}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **PR #:**       {pr.Id}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **Author:**     {pr.Author}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **Branch:**     {pr.SourceBranch} → {pr.TargetBranch}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"- **URL:**        {pr.Url}");
         sb.AppendLine();
         sb.AppendLine("---");
         sb.AppendLine();
 
-        if (!comments.Any())
+        if (comments.Count == 0)
         {
             sb.AppendLine("✅ No issues found — looks good!");
         }
@@ -104,10 +122,10 @@ public class ReviewOutputService
             sb.AppendLine();
             sb.AppendLine($"| Severity | Count |");
             sb.AppendLine($"|----------|-------|");
-            sb.AppendLine($"| 🔴 Critical | {criticalCount} |");
-            sb.AppendLine($"| 🟡 Warning  | {warningCount} |");
-            sb.AppendLine($"| 🔵 Info     | {infoCount} |");
-            sb.AppendLine($"| **Total**   | **{comments.Count}** |");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"| 🔴 Critical | {criticalCount} |");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"| 🟡 Warning  | {warningCount} |");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"| 🔵 Info     | {infoCount} |");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"| **Total**   | **{comments.Count}** |");
             sb.AppendLine();
             sb.AppendLine("---");
             sb.AppendLine();
@@ -116,49 +134,64 @@ public class ReviewOutputService
             sb.AppendLine("## Review Comments");
             sb.AppendLine();
 
-            IEnumerable<IGrouping<string, ReviewComment>> grouped = comments.GroupBy(c => c.FilePath);
+            List<ReviewComment> primaryComments = [.. comments.Where(c => !c.IsAdditionalObservation)];
+            List<ReviewComment> additionalComments = [.. comments.Where(c => c.IsAdditionalObservation)];
 
-            foreach (IGrouping<string, ReviewComment> fileGroup in grouped)
+            void AppendCommentGroup(IEnumerable<ReviewComment> items)
             {
-                sb.AppendLine($"### 📄 `{fileGroup.Key}`");
-                sb.AppendLine();
-
-                foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
+                foreach (IGrouping<string, ReviewComment> fileGroup in items.GroupBy(c => c.FilePath))
                 {
-                    string icon = comment.Severity switch
-                    {
-                        CommentSeverity.Critical => "🔴 Critical",
-                        CommentSeverity.Warning => "🟡 Warning",
-                        _ => "🔵 Info"
-                    };
-
-                    string lineInfo = comment.LineNumber.HasValue
-                        ? $" — Line {comment.LineNumber}"
-                        : "";
-
-                    sb.AppendLine($"#### {icon}{lineInfo}");
+                    sb.AppendLine(CultureInfo.InvariantCulture, $"### 📄 `{fileGroup.Key}`");
                     sb.AppendLine();
-                    sb.AppendLine($"**Issue:** {comment.Issue}");
-                    sb.AppendLine();
-                    sb.AppendLine($"{comment.Suggestion}");
 
-                    if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                    foreach (ReviewComment? comment in fileGroup.OrderBy(c => c.LineNumber))
                     {
-                        sb.AppendLine();
-                        sb.AppendLine("**Suggested change:**");
-                        sb.AppendLine();
+                        string icon = comment.Severity switch
+                        {
+                            CommentSeverity.Critical => "🔴 Critical",
+                            CommentSeverity.Warning => "🟡 Warning",
+                            _ => "🔵 Info"
+                        };
 
-                        // Pick syntax highlighting hint from file extension
-                        string lang = GetLanguageHint(fileGroup.Key);
-                        sb.AppendLine($"```{lang}");
-                        sb.AppendLine(comment.CodeExample.TrimEnd());
-                        sb.AppendLine("```");
+                        string lineInfo = comment.LineNumber.HasValue
+                            ? $" — Line {comment.LineNumber}"
+                            : "";
+
+                        sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo}");
+                        sb.AppendLine();
+                        sb.AppendLine(CultureInfo.InvariantCulture, $"**Issue:** {comment.Issue}");
+                        sb.AppendLine();
+                        sb.AppendLine(CultureInfo.InvariantCulture, $"{comment.Suggestion}");
+
+                        if (!string.IsNullOrWhiteSpace(comment.CodeExample))
+                        {
+                            sb.AppendLine();
+                            sb.AppendLine("**Suggested change:**");
+                            sb.AppendLine();
+
+                            string lang = GetLanguageHint(fileGroup.Key);
+                            sb.AppendLine(CultureInfo.InvariantCulture, $"```{lang}");
+                            sb.AppendLine(comment.CodeExample.TrimEnd());
+                            sb.AppendLine("```");
+                        }
+
+                        sb.AppendLine();
+                        sb.AppendLine("---");
+                        sb.AppendLine();
                     }
-
-                    sb.AppendLine();
-                    sb.AppendLine("---");
-                    sb.AppendLine();
                 }
+            }
+
+            if (primaryComments.Count != 0)
+            {
+                AppendCommentGroup(primaryComments);
+            }
+
+            if (additionalComments.Count != 0)
+            {
+                sb.AppendLine("## 💡 Additional Observations (outside PR changes)");
+                sb.AppendLine();
+                AppendCommentGroup(additionalComments);
             }
         }
 
@@ -166,9 +199,9 @@ public class ReviewOutputService
         return filePath;
     }
 
-    public string FormatCommentForAzureDevOps(ReviewComment comment)
+    public static string FormatCommentForAzureDevOps(ReviewComment comment)
     {
-        var sb = new StringBuilder();
+        StringBuilder sb = new();
         string emoji = comment.Severity switch
         {
             CommentSeverity.Critical => "🔴 **Critical**",
@@ -176,7 +209,7 @@ public class ReviewOutputService
             _ => "🔵 **Info**"
         };
 
-        sb.AppendLine($"{emoji}: {comment.Issue}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"{emoji}: {comment.Issue}");
         sb.AppendLine();
         sb.AppendLine(comment.Suggestion);
 
@@ -197,13 +230,15 @@ public class ReviewOutputService
 
     private static string BuildFileName(PullRequestInfo pr)
     {
-        string date = DateTime.Now.ToString("yyyy-MM-dd");
+        string date = DateTime.Now.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         string repo = SanitizeForFileName(pr.RepositoryName);
         string prTitle = SanitizeForFileName(pr.Title);
 
         // Keep title segment reasonable — max 50 chars
         if (prTitle.Length > 50)
+        {
             prTitle = prTitle[..50].TrimEnd('-');
+        }
 
         return $"{date}_{repo}_PR{pr.Id}_{prTitle}.txt";
     }
@@ -211,8 +246,8 @@ public class ReviewOutputService
     private static string SanitizeForFileName(string value)
     {
         // Replace invalid filename chars and spaces with hyphens, collapse runs
-        HashSet<char> invalid = Path.GetInvalidFileNameChars().ToHashSet();
-        var result = new StringBuilder();
+        HashSet<char> invalid = [.. Path.GetInvalidFileNameChars()];
+        StringBuilder result = new();
         bool lastWasHyphen = false;
 
         foreach (char ch in value)

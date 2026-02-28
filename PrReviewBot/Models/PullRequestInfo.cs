@@ -10,7 +10,7 @@ public class PullRequestInfo
     public string TargetBranch { get; set; } = "";
     public string RepositoryName { get; set; } = "";
     public string RepositoryId { get; set; } = "";
-    public List<ChangedFile> ChangedFiles { get; set; } = new();
+    public List<ChangedFile> ChangedFiles { get; set; } = [];
     public string Url { get; set; } = "";
 }
 

@@ -8,6 +8,7 @@ public class ReviewComment
     public string Issue { get; set; } = "";
     public string Suggestion { get; set; } = "";
     public string? CodeExample { get; set; }
+    public bool IsAdditionalObservation { get; set; }
 }
 
 public enum CommentSeverity

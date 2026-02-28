@@ -1,4 +1,6 @@
-﻿using Microsoft.TeamFoundation.SourceControl.WebApi;
+﻿using System.Globalization;
+using System.Text;
+using Microsoft.TeamFoundation.SourceControl.WebApi;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.WebApi;
 using PrReviewBot.Config;
@@ -14,7 +16,7 @@ public class AzureDevOpsService
     public AzureDevOpsService(AzureDevOpsSettings settings)
     {
         _settings = settings;
-        VssBasicCredential credentials = new VssBasicCredential(string.Empty, settings.PersonalAccessToken);
+        VssBasicCredential credentials = new(string.Empty, settings.PersonalAccessToken);
         _connection = new VssConnection(new Uri(settings.OrganizationUrl), credentials);
     }
 
@@ -25,15 +27,15 @@ public class AzureDevOpsService
 
         // Filter out disabled repositories — they are returned by GetRepositoriesAsync
         // but throw TF401019 when used in subsequent API calls like GetPullRequestsAsync
-        repos = repos.Where(r => r.IsDisabled != true).ToList();
+        repos = [.. repos.Where(r => r.IsDisabled != true)];
 
-        List<PullRequestInfo> result = new List<PullRequestInfo>();
+        List<PullRequestInfo> result = [];
 
         Guid reviewerId = await GetCurrentUserIdAsync();
 
         foreach (GitRepository? repo in repos)
         {
-            GitPullRequestSearchCriteria searchCriteria = new GitPullRequestSearchCriteria
+            GitPullRequestSearchCriteria searchCriteria = new()
             {
                 Status = PullRequestStatus.Active,
                 ReviewerId = reviewerId
@@ -68,13 +70,16 @@ public class AzureDevOpsService
     private async Task<List<ChangedFile>> GetPrChangesAsync(
         GitHttpClient gitClient, string repoId, GitPullRequest pr)
     {
-        List<ChangedFile> result = new List<ChangedFile>();
+        List<ChangedFile> result = [];
         try
         {
             List<GitPullRequestIteration> iterations = await gitClient.GetPullRequestIterationsAsync(
                 _settings.Project, repoId, pr.PullRequestId);
 
-            if (!iterations.Any()) return result;
+            if (iterations.Count == 0)
+            {
+                return result;
+            }
 
             GitPullRequestIteration latestIteration = iterations.OrderByDescending(i => i.Id).First();
 
@@ -83,10 +88,13 @@ public class AzureDevOpsService
 
             foreach (GitPullRequestChange? change in changes.ChangeEntries.Take(20))
             {
-                var filePath = change.Item.Path;
-                if (!IsCodeFile(filePath)) continue;
+                string filePath = change.Item.Path;
+                if (!IsCodeFile(filePath))
+                {
+                    continue;
+                }
 
-                var diff = await GetFileContentAsync(gitClient, repoId, pr, filePath);
+                string diff = await GetFileDiffAsync(gitClient, repoId, pr, filePath, change.ChangeType);
                 result.Add(new ChangedFile
                 {
                     Path = filePath,
@@ -103,29 +111,110 @@ public class AzureDevOpsService
         return result;
     }
 
-    private async Task<string> GetFileContentAsync(
-        GitHttpClient gitClient, string repoId, GitPullRequest pr, string filePath)
+    private async Task<string> GetFileDiffAsync(
+        GitHttpClient gitClient, string repoId, GitPullRequest pr, string filePath,
+        VersionControlChangeType changeType)
     {
         try
         {
-            GitVersionDescriptor sourceVersion = new GitVersionDescriptor
+            string oldContent = "";
+            string newContent = "";
+
+            bool isAdd = changeType.HasFlag(VersionControlChangeType.Add);
+            bool isDelete = changeType.HasFlag(VersionControlChangeType.Delete);
+
+            if (!isDelete)
             {
-                Version = pr.SourceRefName.Replace("refs/heads/", ""),
-                VersionType = GitVersionType.Branch
-            };
+                GitVersionDescriptor sourceVersion = new()
+                {
+                    Version = pr.SourceRefName.Replace("refs/heads/", ""),
+                    VersionType = GitVersionType.Branch
+                };
+                newContent = await ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
+            }
 
-            using Stream stream = await gitClient.GetItemContentAsync(
-                repoId, filePath, versionDescriptor: sourceVersion);
-            using StreamReader reader = new StreamReader(stream);
-            var content = await reader.ReadToEndAsync();
+            if (!isAdd)
+            {
+                GitVersionDescriptor targetVersion = new()
+                {
+                    Version = pr.TargetRefName.Replace("refs/heads/", ""),
+                    VersionType = GitVersionType.Branch
+                };
+                oldContent = await ReadStreamAsync(gitClient, repoId, filePath, targetVersion);
+            }
 
-            IEnumerable<string> lines = content.Split('\n').Take(300);
-            return string.Join('\n', lines);
+            return GenerateUnifiedDiff(oldContent, newContent);
         }
         catch
         {
-            return "[Could not retrieve file content]";
+            return "[Could not retrieve file diff]";
         }
+    }
+
+    private static async Task<string> ReadStreamAsync(
+        GitHttpClient gitClient, string repoId, string filePath, GitVersionDescriptor version)
+    {
+        using Stream stream = await gitClient.GetItemContentAsync(repoId, filePath, versionDescriptor: version);
+        using StreamReader reader = new(stream);
+        return await reader.ReadToEndAsync();
+    }
+
+    private static string GenerateUnifiedDiff(string oldContent, string newContent)
+    {
+        const int maxLines = 300;
+        string[] oldLines = oldContent.Length == 0 ? [] : oldContent.Split('\n');
+        string[] newLines = newContent.Length == 0 ? [] : newContent.Split('\n');
+
+        if (oldLines.Length > maxLines)
+        {
+            oldLines = oldLines[..maxLines];
+        }
+
+        if (newLines.Length > maxLines)
+        {
+            newLines = newLines[..maxLines];
+        }
+
+        List<(char op, string line)> diff = ComputeLineDiff(oldLines, newLines);
+
+        StringBuilder sb = new();
+        foreach ((char op, string? line) in diff)
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture, $"{op}{line}");
+        }
+
+        return sb.ToString();
+    }
+
+    private static List<(char op, string line)> ComputeLineDiff(string[] oldLines, string[] newLines)
+    {
+        int m = oldLines.Length, n = newLines.Length;
+        int[,] dp = new int[m + 1, n + 1];
+
+        for (int i = 1; i <= m; i++)
+        {
+            for (int j = 1; j <= n; j++)
+            {
+                dp[i, j] = oldLines[i - 1] == newLines[j - 1]
+                    ? dp[i - 1, j - 1] + 1
+                    : Math.Max(dp[i - 1, j], dp[i, j - 1]);
+            }
+        }
+
+        List<(char, string)> result = new(m + n);
+        int x = m, y = n;
+        while (x > 0 || y > 0)
+        {
+            if (x > 0 && y > 0 && oldLines[x - 1] == newLines[y - 1])
+            { result.Add((' ', oldLines[x - 1])); x--; y--; }
+            else if (y > 0 && (x == 0 || dp[x, y - 1] >= dp[x - 1, y]))
+            { result.Add(('+', newLines[y - 1])); y--; }
+            else
+            { result.Add(('-', oldLines[x - 1])); x--; }
+        }
+
+        result.Reverse();
+        return result;
     }
 
     private async Task<Guid> GetCurrentUserIdAsync()
@@ -188,8 +277,8 @@ public class AzureDevOpsService
 
     private static bool IsCodeFile(string path)
     {
-        var codeExtensions = new[] { ".cs", ".vue", ".ts", ".js", ".tsx", ".jsx",
-            ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss" };
+        string[] codeExtensions = [ ".cs", ".vue", ".ts", ".js", ".tsx", ".jsx",
+            ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss" ];
         return codeExtensions.Any(ext => path.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
     }
 }
