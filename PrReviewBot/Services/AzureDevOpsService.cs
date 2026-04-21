@@ -49,6 +49,11 @@ public class AzureDevOpsService
 
             foreach (GitPullRequest? pr in prs)
             {
+                if (pr.IsDraft == true)
+                {
+                    continue;
+                }
+
                 List<ChangedFile> changes = await GetPrChangesAsync(gitClient, repo.Id.ToString(), pr);
                 result.Add(new PullRequestInfo
                 {
@@ -90,8 +95,8 @@ public class AzureDevOpsService
 
             foreach (GitPullRequestChange? change in changes.ChangeEntries.Take(20))
             {
-                string filePath = change.Item.Path;
-                if (!IsCodeFile(filePath))
+                string? filePath = change.Item?.Path;
+                if (string.IsNullOrEmpty(filePath) || !IsCodeFile(filePath))
                 {
                     continue;
                 }
@@ -277,10 +282,12 @@ public class AzureDevOpsService
         await gitClient.CreateThreadAsync(thread, repoId, prId, _settings.Project);
     }
 
-    private static bool IsCodeFile(string path)
+    private static bool IsCodeFile(string? path)
     {
+        if (string.IsNullOrEmpty(path)) return false;
+
         string[] codeExtensions = [ ".cs", ".vue", ".ts", ".js", ".tsx", ".jsx",
-            ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss" ];
+            ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss", ".esproj" ];
         return codeExtensions.Any(ext => path.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
     }
 }

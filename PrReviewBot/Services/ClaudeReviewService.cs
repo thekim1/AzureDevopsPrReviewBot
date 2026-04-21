@@ -66,6 +66,9 @@ public class ClaudeReviewService
         Your reviews are practical and constructive. You provide specific, actionable feedback
         with corrected code examples. You focus on real issues, not nitpicks.
 
+        LANGUAGE: Write all review text (the "issue" and "suggestion" fields) in Swedish.
+        Code examples in the "codeExample" field must remain in English.
+
         The input is in unified diff format. Each line is prefixed with:
         - `+` : line added in this PR
         - `-` : line removed in this PR

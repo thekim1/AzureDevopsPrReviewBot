@@ -38,11 +38,11 @@ if (pullRequests.Count == 0)
 AnsiConsole.MarkupLine($"\n[bold]Found {pullRequests.Count} PR(s) to review:[/]");
 for (int i = 0; i < pullRequests.Count; i++)
 {
-    AnsiConsole.MarkupLine($"  {i + 1}. [cyan]{pullRequests[i].Title}[/] by {pullRequests[i].Author}");
+    AnsiConsole.MarkupLine($"  {i + 1}. [cyan]{Markup.Escape(pullRequests[i].Title)}[/] by {Markup.Escape(pullRequests[i].Author)}");
 }
 
 // Let user pick which PR(s) to review
-List<string> choices = [.. pullRequests.Select(pr => $"#{pr.Id}: {pr.Title}")];
+List<string> choices = [.. pullRequests.Select(pr => $"#{pr.Id}: {Markup.Escape(pr.Title)}")];
 choices.Insert(0, "All PRs");
 
 List<string> selected = await AnsiConsole.PromptAsync(
@@ -70,7 +70,7 @@ foreach (PullRequestInfo pr in toReview)
     ReviewOutputService.DisplayReview(pr, comments);
 
     string savedPath = outputService.SaveReviewToFile(pr, comments);
-    AnsiConsole.MarkupLine($"[grey]📝 Review saved to: {savedPath}[/]");
+    AnsiConsole.MarkupLine($"[grey]📝 Review saved to: {Markup.Escape(savedPath)}[/]");
 
     // Ask to post comments
     if (comments.Count != 0)

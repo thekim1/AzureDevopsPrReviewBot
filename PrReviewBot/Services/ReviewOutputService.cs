@@ -17,9 +17,9 @@ public class ReviewOutputService
 
     public static void DisplayReview(PullRequestInfo pr, List<ReviewComment> comments)
     {
-        AnsiConsole.Write(new Rule($"[bold blue]PR #{pr.Id}: {pr.Title}[/]").LeftJustified());
-        AnsiConsole.MarkupLine($"[grey]Author: {pr.Author} | {pr.SourceBranch} → {pr.TargetBranch}[/]");
-        AnsiConsole.MarkupLine($"[grey]URL: {pr.Url}[/]");
+        AnsiConsole.Write(new Rule($"[bold blue]PR #{pr.Id}: {Markup.Escape(pr.Title)}[/]").LeftJustified());
+        AnsiConsole.MarkupLine($"[grey]Author: {Markup.Escape(pr.Author)} | {Markup.Escape(pr.SourceBranch)} → {Markup.Escape(pr.TargetBranch)}[/]");
+        AnsiConsole.MarkupLine($"[grey]URL: {Markup.Escape(pr.Url)}[/]");
         AnsiConsole.WriteLine();
 
         if (comments.Count == 0)
