@@ -12,6 +12,8 @@ public class PullRequestInfo
     public string RepositoryId { get; set; } = "";
     public List<ChangedFile> ChangedFiles { get; set; } = [];
     public string Url { get; set; } = "";
+    // True when the current user is a reviewer on the PR.
+    public bool IsAssignedToMe { get; set; }
 }
 
 public class ChangedFile

@@ -4,6 +4,7 @@ public class AppSettings
 {
     public AzureDevOpsSettings AzureDevOps { get; set; } = new();
     public ClaudeSettings Claude { get; set; } = new();
+    public OllamaSettings Ollama { get; set; } = new();
 }
 
 public class AzureDevOpsSettings
@@ -18,4 +19,11 @@ public class ClaudeSettings
 {
     public string ApiKey { get; set; } = "";
     public string Model { get; set; } = "claude-sonnet-4-6";
+}
+
+public class OllamaSettings
+{
+    public string ApiKey { get; set; } = "";
+    public string BaseUrl { get; set; } = "https://ollama.com/api";
+    public string Model { get; set; } = "glm-5.2:cloud";
 }

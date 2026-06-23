@@ -23,6 +23,13 @@ public class AzureDevOpsService
     }
 
     public async Task<List<PullRequestInfo>> GetAssignedPullRequestsAsync()
+        => [.. (await GetAllActivePullRequestsAsync()).Where(pr => pr.IsAssignedToMe)];
+
+    // Fetches all active, non-draft PRs across every enabled repository in the
+    // project and marks which ones are assigned to the authenticated user
+    // (IsAssignedToMe). Callers can partition the result into "assigned to me"
+    // and "other" groups.
+    public async Task<List<PullRequestInfo>> GetAllActivePullRequestsAsync()
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
         List<GitRepository> repos = await gitClient.GetRepositoriesAsync(_settings.Project);
@@ -39,8 +46,7 @@ public class AzureDevOpsService
         {
             GitPullRequestSearchCriteria searchCriteria = new()
             {
-                Status = PullRequestStatus.Active,
-                ReviewerId = reviewerId
+                Status = PullRequestStatus.Active
             };
 
             // Fix CS1744: remove duplicate positional+named project args
@@ -54,7 +60,8 @@ public class AzureDevOpsService
                     continue;
                 }
 
-                List<ChangedFile> changes = await GetPrChangesAsync(gitClient, repo.Id.ToString(), pr);
+                bool isAssignedToMe = pr.Reviewers is not null
+                    && pr.Reviewers.Any(r => Guid.TryParse(r.Id, out Guid id) && id == reviewerId);
                 result.Add(new PullRequestInfo
                 {
                     Id = pr.PullRequestId,
@@ -65,8 +72,11 @@ public class AzureDevOpsService
                     TargetBranch = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
                     RepositoryName = repo.Name,
                     RepositoryId = repo.Id.ToString(),
-                    ChangedFiles = changes,
-                    Url = $"{_settings.OrganizationUrl}/{_settings.Project}/_git/{repo.Name}/pullrequest/{pr.PullRequestId}"
+                    // Diffs are not fetched here — the listing only needs metadata.
+                    // Call LoadPrChangesAsync for selected PRs before reviewing.
+                    ChangedFiles = [],
+                    Url = $"{_settings.OrganizationUrl}/{_settings.Project}/_git/{repo.Name}/pullrequest/{pr.PullRequestId}",
+                    IsAssignedToMe = isAssignedToMe
                 });
             }
         }
@@ -74,14 +84,25 @@ public class AzureDevOpsService
         return result;
     }
 
+    // Lazily fetch the diff for a single selected PR and populate its
+    // ChangedFiles. Call this only for PRs the user chose to review.
+    public async Task LoadPrChangesAsync(PullRequestInfo pr)
+    {
+        GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
+        pr.ChangedFiles = await GetPrChangesAsync(
+            gitClient, pr.RepositoryId, pr.Id,
+            RefsHeadsPrefix + pr.SourceBranch, RefsHeadsPrefix + pr.TargetBranch);
+    }
+
     private async Task<List<ChangedFile>> GetPrChangesAsync(
-        GitHttpClient gitClient, string repoId, GitPullRequest pr)
+        GitHttpClient gitClient, string repoId, int prId,
+        string sourceRefName, string targetRefName)
     {
         List<ChangedFile> result = [];
         try
         {
             List<GitPullRequestIteration> iterations = await gitClient.GetPullRequestIterationsAsync(
-                _settings.Project, repoId, pr.PullRequestId);
+                _settings.Project, repoId, prId);
 
             if (iterations.Count == 0)
             {
@@ -91,7 +112,7 @@ public class AzureDevOpsService
             GitPullRequestIteration latestIteration = iterations.OrderByDescending(i => i.Id).First();
 
             GitPullRequestIterationChanges changes = await gitClient.GetPullRequestIterationChangesAsync(
-                _settings.Project, repoId, pr.PullRequestId, latestIteration.Id!.Value);
+                _settings.Project, repoId, prId, latestIteration.Id!.Value);
 
             foreach (GitPullRequestChange? change in changes.ChangeEntries.Take(20))
             {
@@ -101,7 +122,8 @@ public class AzureDevOpsService
                     continue;
                 }
 
-                string diff = await GetFileDiffAsync(gitClient, repoId, pr, filePath, change.ChangeType);
+                string diff = await GetFileDiffAsync(
+                    gitClient, repoId, filePath, change.ChangeType, sourceRefName, targetRefName);
                 result.Add(new ChangedFile
                 {
                     Path = filePath,
@@ -112,15 +134,15 @@ public class AzureDevOpsService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Warning: Could not get changes for PR #{pr.PullRequestId}: {ex.Message}");
+            Console.WriteLine($"Warning: Could not get changes for PR #{prId}: {ex.Message}");
         }
 
         return result;
     }
 
     private async Task<string> GetFileDiffAsync(
-        GitHttpClient gitClient, string repoId, GitPullRequest pr, string filePath,
-        VersionControlChangeType changeType)
+        GitHttpClient gitClient, string repoId, string filePath,
+        VersionControlChangeType changeType, string sourceRefName, string targetRefName)
     {
         try
         {
@@ -134,7 +156,7 @@ public class AzureDevOpsService
             {
                 GitVersionDescriptor sourceVersion = new()
                 {
-                    Version = pr.SourceRefName.Replace(RefsHeadsPrefix, ""),
+                    Version = sourceRefName.Replace(RefsHeadsPrefix, ""),
                     VersionType = GitVersionType.Branch
                 };
                 newContent = await ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
@@ -144,7 +166,7 @@ public class AzureDevOpsService
             {
                 GitVersionDescriptor targetVersion = new()
                 {
-                    Version = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
+                    Version = targetRefName.Replace(RefsHeadsPrefix, ""),
                     VersionType = GitVersionType.Branch
                 };
                 oldContent = await ReadStreamAsync(gitClient, repoId, filePath, targetVersion);

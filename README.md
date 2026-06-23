@@ -53,11 +53,18 @@ Open `PrReviewBot/appsettings.json` and fill in your values:
   "Claude": {
     "ApiKey": "YOUR_ANTHROPIC_API_KEY",
     "Model": "claude-sonnet-4-6"
+  },
+  "Ollama": {
+    "ApiKey": "YOUR_OLLAMA_API_KEY",
+    "BaseUrl": "https://ollama.com/api",
+    "Model": "glm-5.2:cloud"
   }
 }
 ```
 
 > ⚠️ **Do not commit secrets.** Use [.NET User Secrets](#using-net-user-secrets-recommended) or environment variables instead.
+
+At startup the app asks which provider to use (**Claude** or **Ollama**). Both the Anthropic API key and the Ollama API key can be configured; only the selected provider is used per run.
 
 ### 3. Build and run
 
@@ -86,6 +93,9 @@ The app loads configuration from the following sources in order (later sources o
 | `AzureDevOps:ReviewerEmail` | Your email — used to identify PRs assigned to you |
 | `Claude:ApiKey` | Your Anthropic API key |
 | `Claude:Model` | Claude model to use (default: `claude-sonnet-4-6`) |
+| `Ollama:ApiKey` | Your Ollama API key (for ollama.com cloud; leave empty for local Ollama) |
+| `Ollama:BaseUrl` | Ollama API base URL (default: `https://ollama.com/api`; use `http://localhost:11434/api` for local) |
+| `Ollama:Model` | Ollama model to use (default: `glm-5.2:cloud`) |
 
 ### Using .NET User Secrets (Recommended)
 
@@ -96,6 +106,7 @@ cd PrReviewBot
 dotnet user-secrets init
 dotnet user-secrets set "AzureDevOps:PersonalAccessToken" "YOUR_PAT"
 dotnet user-secrets set "Claude:ApiKey" "YOUR_ANTHROPIC_API_KEY"
+dotnet user-secrets set "Ollama:ApiKey" "YOUR_OLLAMA_API_KEY"
 ```
 
 ### Using Environment Variables
@@ -104,10 +115,12 @@ dotnet user-secrets set "Claude:ApiKey" "YOUR_ANTHROPIC_API_KEY"
 # Windows (PowerShell)
 $env:AzureDevOps__PersonalAccessToken = "YOUR_PAT"
 $env:Claude__ApiKey = "YOUR_ANTHROPIC_API_KEY"
+$env:Ollama__ApiKey = "YOUR_OLLAMA_API_KEY"
 
 # Linux / macOS
 export AzureDevOps__PersonalAccessToken="YOUR_PAT"
 export Claude__ApiKey="YOUR_ANTHROPIC_API_KEY"
+export Ollama__ApiKey="YOUR_OLLAMA_API_KEY"
 ```
 
 > Note: Use double underscores (`__`) as the separator for nested keys in environment variables.
@@ -157,6 +170,8 @@ PrReviewBot/
 ├── Services/
 │   ├── AzureDevOpsService.cs   # Azure DevOps API integration
 │   ├── ClaudeReviewService.cs  # Anthropic Claude AI integration
+│   ├── OllamaReviewService.cs  # Ollama API integration (local or ollama.com)
+│   ├── ReviewHelpers.cs        # Shared review prompt + response parsing
 │   └── ReviewOutputService.cs  # Terminal display + file output
 ├── Program.cs                  # Entry point + interactive CLI flow
 └── appsettings.json            # Configuration file
@@ -192,3 +207,6 @@ PrReviewBot/
 | `Microsoft.VisualStudio.Services.Client` | Azure DevOps authentication & connection |
 | `Spectre.Console` | Rich terminal UI (colors, spinners, panels) |
 | `Microsoft.Extensions.Configuration.*` | JSON + env var + user secrets config |
+
+> Ollama is accessed via plain `HttpClient` (no SDK dependency) against the
+> `/api/generate` endpoint, so it works with both local Ollama and ollama.com.
