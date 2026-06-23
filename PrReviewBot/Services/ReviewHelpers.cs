@@ -24,10 +24,25 @@ internal static class ReviewHelpers
         LANGUAGE: Write all review text (the "issue" and "suggestion" fields) in Swedish.
         Code examples in the "codeExample" field must remain in English.
 
-        The input is in unified diff format. Each line is prefixed with:
-        - `+` : line added in this PR
-        - `-` : line removed in this PR
-        - ` ` (space): unchanged context line
+        The input is a line-numbered diff. Every line is annotated with the line number it
+        has in the file, in this exact format:
+            <sign><lineNumber> | <content>
+        where sign is:
+        - `+` : line added in this PR — <lineNumber> is the line in the NEW file
+        - `-` : line removed in this PR — <lineNumber> is the line in the OLD file
+        - ` ` (space): unchanged context line — <lineNumber> is the line in the NEW file
+
+        CRITICAL — line numbers: The "lineNumber" field MUST be the line number in the
+        NEW version of the file, taken directly from the number shown on the line in the
+        diff. Do NOT count lines yourself or use the position of the line inside the diff
+        block. For issues about a removed line, use the line number of the closest added or
+        unchanged line in the NEW file so the comment anchors correctly. Always copy the
+        number exactly as printed in the diff annotation.
+
+        EXISTING COMMENTS: The input may include an "EXISTING PR COMMENTS" section with
+        feedback already left by others. Read these first. Do NOT repeat or contradict
+        what has already been said. You may build on them, confirm a prior concern with
+        new evidence, or note that a raised question is addressed/resolved by the changes.
 
         PRIMARY REVIEW: Focus exclusively on lines starting with `+` or `-`. Only comment on
         unchanged context lines if they contain a critical bug that directly interacts with the changes.
@@ -49,6 +64,8 @@ internal static class ReviewHelpers
             "isAdditionalObservation": false
           }
         ]
+
+        The "filePath" must match one of the file paths given in the input exactly.
 
         Severity levels: "Info", "Warning", "Critical"
         - Critical: Security issues, data loss, crashes, serious bugs
@@ -76,12 +93,26 @@ internal static class ReviewHelpers
             sb.AppendLine(CultureInfo.InvariantCulture, $"Description: {pr.Description}");
         }
 
+        if (pr.ExistingComments.Count != 0)
+        {
+            sb.AppendLine();
+            sb.AppendLine("=== EXISTING PR COMMENTS (already made by others — take these into account; do not repeat or contradict them) ===");
+            foreach (PrComment c in pr.ExistingComments)
+            {
+                string location = c.FilePath is not null
+                    ? $" [{c.FilePath}{(c.LineNumber.HasValue ? $":{c.LineNumber}" : "")}]"
+                    : " [PR-level]";
+                sb.AppendLine(CultureInfo.InvariantCulture, $"{c.Author}{location}: {c.Content}");
+            }
+        }
+
         sb.AppendLine();
 
         foreach (ChangedFile file in pr.ChangedFiles)
         {
             sb.AppendLine(CultureInfo.InvariantCulture, $"=== FILE: {file.Path} ({file.ChangeType}) ===");
-            sb.AppendLine("(+ = added, - = removed, space = unchanged context)");
+            sb.AppendLine("Format: <sign><lineNumber> | <content>  (+ added / - removed / space unchanged)");
+            sb.AppendLine("lineNumber is the line in the NEW file for + and space lines, OLD file for - lines.");
             sb.AppendLine(file.Diff);
             sb.AppendLine();
         }

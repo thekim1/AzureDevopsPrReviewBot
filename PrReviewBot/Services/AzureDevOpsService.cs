@@ -62,6 +62,7 @@ public class AzureDevOpsService
 
                 bool isAssignedToMe = pr.Reviewers is not null
                     && pr.Reviewers.Any(r => Guid.TryParse(r.Id, out Guid id) && id == reviewerId);
+                bool hasReviewers = pr.Reviewers is not null && pr.Reviewers.Length != 0;
                 result.Add(new PullRequestInfo
                 {
                     Id = pr.PullRequestId,
@@ -76,7 +77,8 @@ public class AzureDevOpsService
                     // Call LoadPrChangesAsync for selected PRs before reviewing.
                     ChangedFiles = [],
                     Url = $"{_settings.OrganizationUrl}/{_settings.Project}/_git/{repo.Name}/pullrequest/{pr.PullRequestId}",
-                    IsAssignedToMe = isAssignedToMe
+                    IsAssignedToMe = isAssignedToMe,
+                    HasReviewers = hasReviewers
                 });
             }
         }
@@ -92,6 +94,50 @@ public class AzureDevOpsService
         pr.ChangedFiles = await GetPrChangesAsync(
             gitClient, pr.RepositoryId, pr.Id,
             RefsHeadsPrefix + pr.SourceBranch, RefsHeadsPrefix + pr.TargetBranch);
+        pr.ExistingComments = await GetPrCommentsAsync(gitClient, pr.RepositoryId, pr.Id);
+    }
+
+    // Fetches existing comment threads on the PR so the reviewer is aware of
+    // feedback someone else has already left (e.g. decisions, questions).
+    private async Task<List<PrComment>> GetPrCommentsAsync(GitHttpClient gitClient, string repoId, int prId)
+    {
+        List<PrComment> result = [];
+        try
+        {
+            List<GitPullRequestCommentThread> threads = await gitClient.GetThreadsAsync(
+                _settings.Project, repoId, prId);
+
+            foreach (GitPullRequestCommentThread? thread in threads)
+            {
+                if (thread.Comments is null)
+                {
+                    continue;
+                }
+
+                foreach (Comment? c in thread.Comments)
+                {
+                    string content = c?.Content ?? "";
+                    if (string.IsNullOrWhiteSpace(content))
+                    {
+                        continue;
+                    }
+
+                    result.Add(new PrComment
+                    {
+                        Author = c?.Author?.DisplayName ?? "Unknown",
+                        Content = content,
+                        FilePath = thread.ThreadContext?.FilePath,
+                        LineNumber = thread.ThreadContext?.RightFileStart?.Line
+                    });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Warning: Could not get comments for PR #{prId}: {ex.Message}");
+        }
+
+        return result;
     }
 
     private async Task<List<ChangedFile>> GetPrChangesAsync(
@@ -188,6 +234,14 @@ public class AzureDevOpsService
         return await reader.ReadToEndAsync();
     }
 
+    // Generates a line-numbered diff. Every line is annotated with the line
+    // number it has in the relevant file version, so the LLM can return
+    // accurate "lineNumber" values that map directly to the new file.
+    //
+    // Format:  <sign><lineNumber> | <content>
+    //   sign = '+' added (lineNumber is the NEW file line)
+    //   sign = '-' removed (lineNumber is the OLD file line)
+    //   sign = ' ' unchanged (lineNumber is the NEW file line)
     private static string GenerateUnifiedDiff(string oldContent, string newContent)
     {
         const int maxLines = 300;
@@ -204,18 +258,19 @@ public class AzureDevOpsService
             newLines = newLines[..maxLines];
         }
 
-        List<(char op, string line)> diff = ComputeLineDiff(oldLines, newLines);
+        List<(char op, string line, int oldNum, int newNum)> diff = ComputeLineDiff(oldLines, newLines);
 
         StringBuilder sb = new();
-        foreach ((char op, string? line) in diff)
+        foreach ((char op, string? line, int oldNum, int newNum) in diff)
         {
-            sb.AppendLine(CultureInfo.InvariantCulture, $"{op}{line}");
+            string num = op == '-' ? oldNum.ToString(CultureInfo.InvariantCulture) : newNum.ToString(CultureInfo.InvariantCulture);
+            sb.AppendLine(CultureInfo.InvariantCulture, $"{op}{num,5} | {line}");
         }
 
         return sb.ToString();
     }
 
-    private static List<(char op, string line)> ComputeLineDiff(string[] oldLines, string[] newLines)
+    private static List<(char op, string line, int oldNum, int newNum)> ComputeLineDiff(string[] oldLines, string[] newLines)
     {
         int m = oldLines.Length, n = newLines.Length;
         int[,] dp = new int[m + 1, n + 1];
@@ -230,16 +285,16 @@ public class AzureDevOpsService
             }
         }
 
-        List<(char, string)> result = new(m + n);
+        List<(char, string, int, int)> result = new(m + n);
         int x = m, y = n;
         while (x > 0 || y > 0)
         {
             if (x > 0 && y > 0 && oldLines[x - 1] == newLines[y - 1])
-            { result.Add((' ', oldLines[x - 1])); x--; y--; }
+            { result.Add((' ', oldLines[x - 1], x, y)); x--; y--; }
             else if (y > 0 && (x == 0 || dp[x, y - 1] >= dp[x - 1, y]))
-            { result.Add(('+', newLines[y - 1])); y--; }
+            { result.Add(('+', newLines[y - 1], 0, y)); y--; }
             else
-            { result.Add(('-', oldLines[x - 1])); x--; }
+            { result.Add(('-', oldLines[x - 1], x, 0)); x--; }
         }
 
         result.Reverse();
@@ -306,7 +361,10 @@ public class AzureDevOpsService
 
     private static bool IsCodeFile(string? path)
     {
-        if (string.IsNullOrEmpty(path)) return false;
+        if (string.IsNullOrEmpty(path))
+        {
+            return false;
+        }
 
         string[] codeExtensions = [ ".cs", ".vue", ".ts", ".js", ".tsx", ".jsx",
             ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss", ".esproj" ];

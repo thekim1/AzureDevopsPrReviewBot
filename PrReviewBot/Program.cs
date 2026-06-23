@@ -41,7 +41,7 @@ await AnsiConsole.Status()
     });
 
 List<PullRequestInfo> assignedToMe = [.. pullRequests.Where(pr => pr.IsAssignedToMe)];
-List<PullRequestInfo> otherPrs = [.. pullRequests.Where(pr => !pr.IsAssignedToMe)];
+List<PullRequestInfo> otherPrs = [.. pullRequests.Where(pr => !pr.IsAssignedToMe && pr.HasReviewers)];
 
 if (pullRequests.Count == 0)
 {
