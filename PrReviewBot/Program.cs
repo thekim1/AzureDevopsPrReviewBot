@@ -36,7 +36,24 @@ await AnsiConsole.Status()
     .Spinner(Spinner.Known.Dots)
     .StartAsync("Fetching pull requests from Azure DevOps...", async ctx =>
     {
+        string[] messages =
+        [
+            "Still fetching... Azure DevOps is having a think 🤔",
+            "Maybe Azure is waiting for someone to approve its own PR?",
+            "Our connection runs on hamster power. The hamster is tired. 🐹",
+            "Azure DevOps appears to be writing a novel...",
+            "Have you tried turning it off and on again?",
+            "The server is consulting the oracle. Please hold.",
+            "Fetching... this is fine. Everything is fine. 🔥",
+            "Almost there (probably). We think. No promises.",
+        ];
+
+        using CancellationTokenSource cts = new();
+        Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+
         pullRequests = await devOpsService.GetAllActivePullRequestsAsync();
+        await cts.CancelAsync();
+        await tickerTask;
         ctx.Status($"Found {pullRequests.Count} active PR(s)");
     });
 
@@ -120,7 +137,24 @@ foreach (PullRequestInfo pr in toReview)
         .Spinner(Spinner.Known.Dots)
         .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
         {
+            string[] messages =
+            [
+                "The AI is staring at your diff very intensely 👀",
+                "Consulting the silicon oracle...",
+                "Generating opinions at scale 🤖",
+                "The model is judging your variable names. Quietly.",
+                "Running on vibes and matrix multiplications.",
+                "Almost done — the AI is just adding dramatic tension.",
+                "Cross-referencing your code with every Stack Overflow post ever 📚",
+                "The tokens are flowing. Wisdom may follow.",
+            ];
+
+            using CancellationTokenSource cts = new();
+            Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+
             comments = await reviewService.ReviewPullRequestAsync(pr);
+            await cts.CancelAsync();
+            await tickerTask;
         });
 
     ReviewOutputService.DisplayReview(pr, comments);
@@ -146,3 +180,23 @@ foreach (PullRequestInfo pr in toReview)
 }
 
 AnsiConsole.MarkupLine("\n[bold green]Review complete![/]");
+
+// Starts a background ticker that updates ctx.Status with rotating funny
+// messages after a 5-second grace period. Stops cleanly when cancellationToken
+// is cancelled. Await the returned Task after cancelling to ensure it has exited.
+static Task StartFunnyTickerAsync(StatusContext ctx, string[] messages, CancellationToken cancellationToken) =>
+    Task.Run(async () =>
+    {
+        try
+        {
+            await Task.Delay(5000, cancellationToken);
+            int i = 0;
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                ctx.Status(messages[i % messages.Length]);
+                i++;
+                await Task.Delay(5000, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }, cancellationToken);
