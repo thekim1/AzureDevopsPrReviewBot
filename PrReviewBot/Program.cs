@@ -19,14 +19,22 @@ ReviewOutputService outputService = new();
 string provider = AnsiConsole.Prompt(
     new SelectionPrompt<string>()
         .Title("Which review provider do you want to use?")
-        .AddChoices("Claude", "Ollama"));
+        .AddChoices("Claude", "Ollama", "Bifrost"));
+
+string providerModel = provider switch
+{
+    "Ollama" => settings.Ollama.Model,
+    "Bifrost" => settings.Bifrost.Model,
+    _ => settings.Claude.Model
+};
 
 IReviewService reviewService = provider switch
 {
     "Ollama" => new OllamaReviewService(settings.Ollama),
+    "Bifrost" => new BifrostReviewService(settings.Bifrost),
     _ => new ClaudeReviewService(settings.Claude)
 };
-AnsiConsole.MarkupLine($"[grey]Using {provider} ({Markup.Escape(provider == "Ollama" ? settings.Ollama.Model : settings.Claude.Model)})[/]");
+AnsiConsole.MarkupLine($"[grey]Using {provider} ({Markup.Escape(providerModel)})[/]");
 
 AnsiConsole.Write(new FigletText("PR Review Bot").Color(Color.Blue));
 

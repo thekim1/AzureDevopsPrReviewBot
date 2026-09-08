@@ -58,13 +58,20 @@ Open `PrReviewBot/appsettings.json` and fill in your values:
     "ApiKey": "YOUR_OLLAMA_API_KEY",
     "BaseUrl": "https://ollama.com/api",
     "Model": "glm-5.2:cloud"
+  },
+  "Bifrost": {
+    "ApiKey": "YOUR_BIFROST_API_KEY",
+    "BaseUrl": "http://localhost:8080/v1",
+    "Model": "anthropic/claude-sonnet-4-5"
   }
 }
 ```
 
 > ⚠️ **Do not commit secrets.** Use [.NET User Secrets](#using-net-user-secrets-recommended) or environment variables instead.
 
-At startup the app asks which provider to use (**Claude** or **Ollama**). Both the Anthropic API key and the Ollama API key can be configured; only the selected provider is used per run.
+At startup the app asks which provider to use (**Claude**, **Ollama**, or **Bifrost**). All provider API keys can be configured; only the selected provider is used per run.
+
+**Bifrost** ([maximhq/bifrost](https://github.com/maximhq/bifrost)) is an LLM gateway that routes to any provider. Models are addressed as `provider/model`, e.g. `anthropic/claude-sonnet-4-5` or `openai/gpt-4o`.
 
 ### 3. Build and run
 
@@ -96,6 +103,9 @@ The app loads configuration from the following sources in order (later sources o
 | `Ollama:ApiKey` | Your Ollama API key (for ollama.com cloud; leave empty for local Ollama) |
 | `Ollama:BaseUrl` | Ollama API base URL (default: `https://ollama.com/api`; use `http://localhost:11434/api` for local) |
 | `Ollama:Model` | Ollama model to use (default: `glm-5.2:cloud`) |
+| `Bifrost:ApiKey` | Your Bifrost API key (e.g. a Bifrost virtual key; leave empty for an unauthenticated local gateway) |
+| `Bifrost:BaseUrl` | Bifrost OpenAI-compatible base URL (default: `http://localhost:8080/v1`) |
+| `Bifrost:Model` | Model in `provider/model` form (default: `anthropic/claude-sonnet-4-5`) |
 
 ### Using .NET User Secrets (Recommended)
 
@@ -107,6 +117,7 @@ dotnet user-secrets init
 dotnet user-secrets set "AzureDevOps:PersonalAccessToken" "YOUR_PAT"
 dotnet user-secrets set "Claude:ApiKey" "YOUR_ANTHROPIC_API_KEY"
 dotnet user-secrets set "Ollama:ApiKey" "YOUR_OLLAMA_API_KEY"
+dotnet user-secrets set "Bifrost:ApiKey" "YOUR_BIFROST_API_KEY"
 ```
 
 ### Using Environment Variables
@@ -116,11 +127,13 @@ dotnet user-secrets set "Ollama:ApiKey" "YOUR_OLLAMA_API_KEY"
 $env:AzureDevOps__PersonalAccessToken = "YOUR_PAT"
 $env:Claude__ApiKey = "YOUR_ANTHROPIC_API_KEY"
 $env:Ollama__ApiKey = "YOUR_OLLAMA_API_KEY"
+$env:Bifrost__ApiKey = "YOUR_BIFROST_API_KEY"
 
 # Linux / macOS
 export AzureDevOps__PersonalAccessToken="YOUR_PAT"
 export Claude__ApiKey="YOUR_ANTHROPIC_API_KEY"
 export Ollama__ApiKey="YOUR_OLLAMA_API_KEY"
+export Bifrost__ApiKey="YOUR_BIFROST_API_KEY"
 ```
 
 > Note: Use double underscores (`__`) as the separator for nested keys in environment variables.
@@ -171,6 +184,7 @@ PrReviewBot/
 │   ├── AzureDevOpsService.cs   # Azure DevOps API integration
 │   ├── ClaudeReviewService.cs  # Anthropic Claude AI integration
 │   ├── OllamaReviewService.cs  # Ollama API integration (local or ollama.com)
+│   ├── BifrostReviewService.cs # Bifrost LLM gateway integration (OpenAI-compatible)
 │   ├── ReviewHelpers.cs        # Shared review prompt + response parsing
 │   └── ReviewOutputService.cs  # Terminal display + file output
 ├── Program.cs                  # Entry point + interactive CLI flow
@@ -210,3 +224,6 @@ PrReviewBot/
 
 > Ollama is accessed via plain `HttpClient` (no SDK dependency) against the
 > `/api/generate` endpoint, so it works with both local Ollama and ollama.com.
+> Bifrost is likewise accessed via plain `HttpClient` against its
+> OpenAI-compatible `/v1/chat/completions` endpoint, so any provider behind
+> the gateway works.
