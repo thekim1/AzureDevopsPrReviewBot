@@ -15,16 +15,68 @@ public class ReviewOutputService
         Directory.CreateDirectory(_outputDirectory);
     }
 
-    public static void DisplayReview(PullRequestInfo pr, List<ReviewComment> comments)
+    // Reports what the local grounding checks threw away. Seeing this is how
+    // you tell a quiet model from an over-aggressive filter.
+    public static void DisplayValidationSummary(ReviewValidationResult validation)
+    {
+        if (validation.DroppedCount == 0 && validation.ReanchoredCount == 0)
+        {
+            return;
+        }
+
+        if (validation.DroppedCount != 0)
+        {
+            string reasons = string.Join(", ",
+                validation.DroppedByReason.OrderByDescending(kv => kv.Value)
+                    .Select(kv => $"{kv.Value}× {kv.Key}"));
+            AnsiConsole.MarkupLine(
+                $"[grey]Filtered out {validation.DroppedCount} unverifiable finding(s): {Markup.Escape(reasons)}[/]");
+        }
+
+        if (validation.ReanchoredCount != 0)
+        {
+            AnsiConsole.MarkupLine(
+                $"[grey]Re-anchored {validation.ReanchoredCount} comment(s) to the line their evidence came from.[/]");
+        }
+    }
+
+    // Writes a provider's unparsable reply next to the reviews so a failure can
+    // be diagnosed without re-running the request.
+    public string SaveRawResponse(PullRequestInfo pr, string rawResponse)
+    {
+        string path = Path.Combine(
+            _outputDirectory,
+            $"{DateTime.Now:yyyy-MM-dd_HHmmss}_PR{pr.Id}_FAILED_raw-response.txt");
+        File.WriteAllText(path, rawResponse, Encoding.UTF8);
+        return path;
+    }
+
+    public static void DisplayReview(
+        PullRequestInfo pr, List<ReviewComment> comments, IReadOnlyList<string>? unreviewedFiles = null)
     {
         AnsiConsole.Write(new Rule($"[bold blue]PR #{pr.Id}: {Markup.Escape(pr.Title)}[/]").LeftJustified());
         AnsiConsole.MarkupLine($"[grey]Author: {Markup.Escape(pr.Author)} | {Markup.Escape(pr.SourceBranch)} → {Markup.Escape(pr.TargetBranch)}[/]");
         AnsiConsole.MarkupLine($"[grey]URL: {Markup.Escape(pr.Url)}[/]");
         AnsiConsole.WriteLine();
 
+        int unreviewed = unreviewedFiles?.Count ?? 0;
+
         if (comments.Count == 0)
         {
-            AnsiConsole.MarkupLine("[green]✓ No issues found — looks good![/]");
+            // "Looks good" is only true if everything was actually looked at.
+            // Saying it after a partial review is the same false green as
+            // reporting a failed parse as a clean review.
+            if (unreviewed != 0)
+            {
+                AnsiConsole.MarkupLine(
+                    $"[yellow]⚠ No issues found in the {pr.ChangedFiles.Count - unreviewed} file(s) that were reviewed — "
+                    + $"but {unreviewed} file(s) could not be reviewed, so this is NOT a clean bill of health.[/]");
+            }
+            else
+            {
+                AnsiConsole.MarkupLine("[green]✓ No issues found — looks good![/]");
+            }
+
             return;
         }
 
@@ -48,9 +100,16 @@ public class ReviewOutputService
         int warningCount = comments.Count(c => c.Severity == CommentSeverity.Warning);
         AnsiConsole.WriteLine();
         AnsiConsole.MarkupLine($"[bold]Summary: [red]{criticalCount} critical[/], [yellow]{warningCount} warnings[/], [blue]{comments.Count - criticalCount - warningCount} info[/][/]");
+
+        if (unreviewed != 0)
+        {
+            AnsiConsole.MarkupLine(
+                $"[yellow]Incomplete: {unreviewed} of {pr.ChangedFiles.Count} file(s) were not reviewed.[/]");
+        }
     }
 
-    public string SaveReviewToFile(PullRequestInfo pr, List<ReviewComment> comments)
+    public string SaveReviewToFile(
+        PullRequestInfo pr, List<ReviewComment> comments, IReadOnlyList<string>? unreviewedFiles = null)
     {
         string fileName = BuildFileName(pr);
         string filePath = Path.Combine(_outputDirectory, fileName);
@@ -70,9 +129,29 @@ public class ReviewOutputService
         sb.AppendLine("---");
         sb.AppendLine();
 
+        // The report outlives the terminal output, so an incomplete review
+        // must say so here too — this file is what someone reads later when
+        // deciding whether the PR was checked.
+        if (unreviewedFiles is { Count: > 0 })
+        {
+            sb.AppendLine(CultureInfo.InvariantCulture,
+                $"> ⚠️ **Incomplete review — {unreviewedFiles.Count} of {pr.ChangedFiles.Count} file(s) could not be reviewed:**");
+            sb.AppendLine(">");
+            foreach (string path in unreviewedFiles)
+            {
+                sb.AppendLine(CultureInfo.InvariantCulture, $"> - `{path}`");
+            }
+
+            sb.AppendLine(">");
+            sb.AppendLine("> Absence of comments on those files does not mean they are clean.");
+            sb.AppendLine();
+        }
+
         if (comments.Count == 0)
         {
-            sb.AppendLine("✅ No issues found — looks good!");
+            sb.AppendLine(unreviewedFiles is { Count: > 0 }
+                ? "⚠️ No issues found in the files that *were* reviewed — see the warning above."
+                : "✅ No issues found — looks good!");
         }
         else
         {
@@ -135,7 +214,7 @@ public class ReviewOutputService
         {
             sb.AppendLine();
             sb.AppendLine("**Suggested change:**");
-            sb.AppendLine("```csharp");
+            sb.AppendLine(CultureInfo.InvariantCulture, $"```{GetLanguageHint(comment.FilePath)}");
             sb.AppendLine(comment.CodeExample);
             sb.AppendLine("```");
         }
@@ -168,7 +247,8 @@ public class ReviewOutputService
                 };
 
                 string lineInfo = comment.LineNumber.HasValue ? $" (line {comment.LineNumber})" : "";
-                AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]: {Markup.Escape(comment.Issue)}");
+                string confidence = comment.Confidence < 5 ? $" [grey]·confidence {comment.Confidence}/5[/]" : "";
+                AnsiConsole.MarkupLine($"\n  {icon} [{color}]{comment.Severity}{lineInfo}[/]{confidence}: {Markup.Escape(comment.Issue)}");
                 AnsiConsole.MarkupLine($"  [grey]{Markup.Escape(comment.Suggestion)}[/]");
 
                 if (!string.IsNullOrWhiteSpace(comment.CodeExample))
@@ -250,6 +330,8 @@ public class ReviewOutputService
                 sb.AppendLine(CultureInfo.InvariantCulture, $"#### {icon}{lineInfo} {scopeTag}");
                 sb.AppendLine();
                 sb.AppendLine(CultureInfo.InvariantCulture, $"**Issue:** {comment.Issue}");
+                sb.AppendLine();
+                sb.AppendLine(CultureInfo.InvariantCulture, $"*Confidence: {comment.Confidence}/5*");
                 sb.AppendLine();
                 sb.AppendLine(CultureInfo.InvariantCulture, $"{comment.Suggestion}");
 

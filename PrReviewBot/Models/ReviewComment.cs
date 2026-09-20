@@ -1,4 +1,4 @@
-﻿namespace PrReviewBot.Models;
+namespace PrReviewBot.Models;
 
 public class ReviewComment
 {
@@ -9,6 +9,8 @@ public class ReviewComment
     public string Suggestion { get; set; } = "";
     public string? CodeExample { get; set; }
     public bool IsAdditionalObservation { get; set; }
+    public string? Evidence { get; set; }
+    public int Confidence { get; set; } = 3;
 }
 
 public enum CommentSeverity

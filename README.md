@@ -1,18 +1,29 @@
 # PR Review Bot
 
-An AI-powered pull request review tool for **Azure DevOps** that uses **Anthropic Claude** to automatically analyze code changes and provide actionable feedback directly in your terminal.
+An AI-powered pull request review tool for **Azure DevOps**. It reviews code changes with the LLM
+of your choice — **Anthropic Claude**, **Ollama** (local or cloud), or anything behind a
+**Bifrost** gateway — and gives you actionable feedback in your terminal, optionally posted back
+to the pull request.
 
-![.NET](https://img.shields.io/badge/.NET-10.0-blueviolet) ![Claude](https://img.shields.io/badge/Claude-Anthropic-orange) ![Azure DevOps](https://img.shields.io/badge/Azure-DevOps-blue)
+Its design goal is **reviews you can trust**: findings the model cannot ground in the diff are
+discarded before you see them, and a review that did not complete is never presented as a clean
+one. See [Review accuracy](#review-accuracy).
+
+![.NET](https://img.shields.io/badge/.NET-10.0-blueviolet) ![Claude](https://img.shields.io/badge/Claude-Anthropic-orange) ![Ollama](https://img.shields.io/badge/Ollama-local%20or%20cloud-lightgrey) ![Bifrost](https://img.shields.io/badge/Bifrost-gateway-brightgreen) ![Azure DevOps](https://img.shields.io/badge/Azure-DevOps-blue)
 
 ---
 
 ## Features
 
 - 🔍 **Fetches PRs assigned to you** across all repositories in an Azure DevOps project
-- 🤖 **AI-powered review** using Claude — identifies bugs, security issues, performance problems, and bad patterns
+- 🤖 **Bring your own model** — Claude, Ollama, or any provider behind a Bifrost gateway, chosen at startup
+- 👀 **Watch it think** — output streams live, with per-batch thinking and answer counters
 - 🎛️ **Interactive selection** — choose one or multiple PRs to review in a single run
 - 📊 **Severity-rated comments** — Critical 🔴, Warning 🟡, Info 🔵
+- 🧭 **Repo-aware** — reads the reviewed repository's own agent instructions (`AGENTS.md`, `CLAUDE.md`, `copilot-instructions.md`), architecture notes and style config, so project conventions are not reported as defects
+- 🛡️ **Grounding checks** — every finding must quote the diff line it came from; findings that quote code the model was never shown are discarded locally, before you ever see them
 - 💬 **Post comments back** to Azure DevOps with a single confirmation
+- 🧩 **Handles large PRs** — reviewed in parallel batches, so one oversized request cannot sink the run
 - 💾 **Saves reviews to disk** as markdown files for later reference
 - 🖥️ **Rich terminal UI** powered by Spectre.Console
 
@@ -25,7 +36,7 @@ An AI-powered pull request review tool for **Azure DevOps** that uses **Anthropi
 | [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Runtime and build toolchain |
 | Azure DevOps account | With access to the target project |
 | Azure DevOps PAT | Personal Access Token with `Code (Read)` and `Code (Write)` scopes |
-| [Anthropic API Key](https://console.anthropic.com/) | Claude API access |
+| A model provider | **One** of: an [Anthropic API key](https://console.anthropic.com/), an [Ollama](https://ollama.com) instance (local needs no key), or a [Bifrost](https://github.com/maximhq/bifrost) gateway |
 
 ---
 
@@ -67,6 +78,10 @@ Open `PrReviewBot/appsettings.json` and fill in your values:
 }
 ```
 
+Everything under `Review` is optional — the defaults are tuned to work out of the box. Add it only
+when you want to change how much context the model sees or how hard its output is filtered; see
+[Review Tuning](#review-tuning-review).
+
 > ⚠️ **Do not commit secrets.** Use [.NET User Secrets](#using-net-user-secrets-recommended) or environment variables instead.
 
 At startup the app asks which provider to use (**Claude**, **Ollama**, or **Bifrost**). All provider API keys can be configured; only the selected provider is used per run.
@@ -106,6 +121,33 @@ The app loads configuration from the following sources in order (later sources o
 | `Bifrost:ApiKey` | Your Bifrost API key (e.g. a Bifrost virtual key; leave empty for an unauthenticated local gateway) |
 | `Bifrost:BaseUrl` | Bifrost OpenAI-compatible base URL (default: `http://localhost:8080/v1`) |
 | `Bifrost:Model` | Model in `provider/model` form (default: `anthropic/claude-sonnet-4-5`) |
+| `Bifrost:ResponseFormat` | Sent as `response_format: {"type": ...}`. Defaults to `json_object` — the OpenAI-style analogue of the native Ollama path's `format: "json"`. **Hybrid reasoning models (GLM, Qwen, DeepSeek) need this**: without a JSON constraint they emit a thinking block that the gateway reports as `reasoning_content`, leaving `content` empty and the review looking like it found nothing. Set to empty to disable if your gateway rejects the parameter |
+| `Bifrost:ExtraParameters` | Extra top-level fields merged into the request body verbatim. Only useful for parameters the OpenAI schema already defines — **Bifrost drops fields it does not recognise**, so Ollama-native switches like `think` never reach the model (verified against a live gateway). Empty this first if a request starts failing |
+| `Bifrost:Temperature` | Optional sampling temperature. Unset by default — Anthropic models reject any value but `1.0`. Set to `0` when routing to OpenAI, Ollama, or another provider that honours it |
+
+### Review Tuning (`Review:*`)
+
+These control how much the reviewer sees and how hard its output is filtered. The defaults are
+tuned so the prompt is *more* useful without being bigger — see [Review accuracy](#review-accuracy).
+
+| Key | Default | Description |
+|---|---|---|
+| `Review:ContextLines` | `12` | Unchanged lines kept either side of a change. The main accuracy dial: too few and the model invents "missing" null checks that live just outside the window |
+| `Review:MaxFilesPerPr` | `20` | Files reviewed per PR; the rest are listed as explicitly not shown |
+| `Review:MaxFilesPerRequest` | `4` | Files per request. A PR is reviewed in several requests — see [Large pull requests](#large-pull-requests) |
+| `Review:MaxDiffCharsPerRequest` | `30000` | Second bound on a request, so one huge file cannot fill a batch past the file-count limit |
+| `Review:ShowThinking` | `true` | Stream the model's output and show a live table of what each batch is thinking and answering. Supported by all three providers. Usage is still reported to the gateway, so cost tracking is unaffected. Set `false` for the plain spinner |
+| `Review:ThinkingPreviewChars` | `220` | How much of the current thought to keep on screen per batch |
+| `Review:MaxParallelRequests` | `3` | Batches in flight at once. Keep it at or below the gateway's upstream connection limit — for Bifrost that is the provider's `max_conns_per_host` — or the surplus requests just queue |
+| `Review:WarmPrefixCache` | `true` | Run the first batch alone so the shared prefix lands in the provider's prompt cache before the rest go out. Costs ~one round trip, makes every later batch far cheaper. Set `false` to favour speed over cost |
+| `Review:ScopeExistingCommentsToBatch` | `true` | Send only the existing PR comments that concern the batch's own files (plus PR-level ones) |
+| `Review:MaxDiffLinesPerFile` | `400` | Cap on emitted diff lines per file, applied after hunking |
+| `Review:MaxOutputTokens` | `16384` | Budget for the model's *answer*. Reasoning models bill their thinking against this too, so 4096 can be exhausted before a single character of JSON is emitted — raise it if reviews come back empty or cut off mid-array |
+| `Review:IncludeRepoContext` | `true` | Read the repo's agent/architecture/style files from the target branch |
+| `Review:MaxRepoContextChars` | `12000` | Total budget for that bundle |
+| `Review:RequireEvidence` | `true` | Discard findings whose quoted line does not appear in the diff |
+| `Review:MinConfidenceToKeep` | `2` | Findings below this self-reported confidence (1–5) are discarded outright |
+| `Review:MinConfidenceToPost` | `4` | Findings below this stay in the saved report but are never posted to Azure DevOps |
 
 ### Using .NET User Secrets (Recommended)
 
@@ -149,7 +191,17 @@ export Bifrost__ApiKey="YOUR_BIFROST_API_KEY"
 │                                                             │
 │  2. Select which PR(s) to review from an interactive list   │
 │                                                             │
-│  3. PR diffs are sent to Claude for analysis                │
+│  3. Changed regions of each file (plus surrounding context) │
+│     are sent to the model, together with the repository's   │
+│     own conventions and any existing PR comments            │
+│                                                             │
+│  3b. Large PRs are split into batches and reviewed in       │
+│     parallel, streaming their progress to the terminal      │
+│                                                             │
+│  3c. Findings are checked against the real diff locally:    │
+│     invented files, unquotable evidence, duplicates and     │
+│     low-confidence guesses are dropped, and the rest are    │
+│     re-anchored to the line their evidence came from        │
 │                                                             │
 │  4. Review results are displayed in the terminal with       │
 │     severity ratings and suggested code fixes               │
@@ -169,6 +221,158 @@ export Bifrost__ApiKey="YOUR_BIFROST_API_KEY"
 | **Warning** | 🟡 | Performance problems, bad patterns, maintainability issues |
 | **Info** | 🔵 | Style improvements, minor suggestions |
 
+Each finding also carries a **confidence** of 1–5: how sure the model is that this is a real
+defect rather than an inference about code it could not see. Low-confidence findings are kept in
+the saved report but are not posted to Azure DevOps (see `Review:MinConfidenceToPost`).
+
+---
+
+## Review accuracy
+
+Most false positives in an LLM code review come from the model reasoning about code it was never
+shown. Four things keep that in check:
+
+1. **Hunk diffs, not whole files.** Only changed regions plus `ContextLines` of surrounding code
+   are sent, and omitted stretches are marked `@@ ... N unchanged line(s) not shown ... @@`.
+   Files that are too large to diff safely are reported as *not reviewed* rather than diffed on a
+   truncated prefix — a truncated prefix makes the entire tail of a file look deleted.
+2. **Repository context.** The reviewed repo's own `AGENTS.md` / `CLAUDE.md` /
+   `copilot-instructions.md`, architecture notes, README and `.editorconfig` are read from the PR's
+   **target branch** and marked authoritative, so a deliberate project convention is not reported
+   as a defect.
+3. **A partial-view rule in the prompt.** The model is told explicitly never to report something as
+   missing, unregistered, unused or never called unless the shown lines prove it.
+4. **Local grounding checks** (`ReviewValidator`). Every finding must quote the source line it
+   refers to. After the response comes back, each quote is looked up in the diff that was actually
+   sent. Findings on files that are not in the PR, or quoting code that was never shown, are
+   discarded; a quote that *is* found also fixes the comment's line number, so comments land on
+   the right line in Azure DevOps. This costs no tokens.
+
+The terminal prints what was filtered on each run, so you can tell a quiet model from an
+over-aggressive filter.
+
+### A partial review is never reported as a clean one
+
+If some batches fail, the terminal and the saved report both say so, name the files that went
+unreviewed, and state plainly that their silence is not approval. "No issues found — looks good"
+appears only when every file was actually looked at.
+
+### A failed review is never reported as a clean one
+
+If a provider returns something that cannot be read as a review — an empty message, or JSON that
+stops mid-array — the run reports the failure, writes the raw reply to
+`reviews/..._FAILED_raw-response.txt`, and moves to the next PR. It never shows
+"No issues found". An empty finding list means the model read the diff and found nothing; those
+are different outcomes and must not look alike.
+
+The most common cause is a reasoning model exhausting `Review:MaxOutputTokens` on thinking before
+it emits any answer. The error message reports `finish_reason` and the token split so you can tell
+that apart from a genuine refusal.
+
+### Watching the model work
+
+With `Review:ShowThinking` (on by default) the review streams, and each batch gets a row showing
+how much it has thought, how much it has answered, and the tail of its current thought:
+
+```
+╭─────────────────┬────────────┬─────────┬────────────────────────────────────╮
+│ Part            │   Thinking │  Answer │ Latest thought                     │
+├─────────────────┼────────────┼─────────┼────────────────────────────────────┤
+│ ● 1. 3 files    │ ~4,100 tok │       — │ ...line 42 dereferences it before  │
+│ ✓ 2. Helper.cs  │ ~1,250 tok │ ~310 tok│                                    │
+│ ✗ 3. 2 files    │ ~16,000 tok│       — │                                    │
+╰─────────────────┴────────────┴─────────┴────────────────────────────────────╯
+```
+
+This is diagnostic, not decoration. A reasoning model can think for minutes before producing any
+answer, and a spinner cannot tell that apart from a hang. A row whose **Thinking** column climbs
+while **Answer** stays at `—` is a request heading for an exhausted output budget; the column turns
+red past 20k tokens so you can see it coming rather than reading about it afterwards.
+
+All three providers stream: Bifrost and Ollama over their HTTP APIs, Claude through the Anthropic
+SDK's `CreateStreaming`. Models that expose their reasoning separately (Claude's thinking blocks,
+Ollama's `thinking` field, `reasoning_content` through a gateway) show it in the **Thinking**
+column; models that do not simply fill the **Answer** column instead.
+
+For Bifrost, streaming sends `stream_options.include_usage`, so the gateway still records
+prompt/completion tokens and cost for every call — nothing is lost from the billing picture. This
+matters if you are routing everything through one gateway precisely to keep AI spend accountable.
+
+### Large pull requests
+
+A PR is **not** reviewed in one request. It is split into batches of at most
+`Review:MaxFilesPerRequest` files (and `Review:MaxDiffCharsPerRequest` characters), reviewed
+separately, and the findings merged.
+
+A single request covering a whole PR fails badly on large changes. Measured on a real 20-file PR:
+97,403 characters of diff went in, the model spent **all 16,384** completion tokens on internal
+reasoning, and returned an empty message after 122 seconds — `finish_reason: "length"`, zero
+characters of answer, and it was still second-guessing findings it had already made when the
+budget ran out. That same PR now splits into six requests of 2.5k–29k characters.
+
+Batching also makes failure partial: a batch that fails costs its own files, and the run says
+exactly which files went unreviewed instead of silently returning fewer findings.
+
+Batches are **independent requests, so they run concurrently** (`Review:MaxParallelRequests`).
+Running them one after another would just multiply wall-clock time by the batch count.
+
+The cost of batching is that every request repeats the same prefix — system prompt, repository
+context, PR metadata. Three things keep that in check:
+
+- **Only the first matching file per context group is read.** Repos often carry `AGENTS.md`,
+  `CLAUDE.md` *and* `copilot-instructions.md`, where two of them just say "see the third";
+  sending all three pays three times for one document, in every batch.
+- **Existing PR comments are scoped to the batch's own files.** A comment about a file the model
+  cannot see is noise it has to read and pay for.
+- **The first batch runs alone to warm the provider's prompt cache** (`Review:WarmPrefixCache`).
+  Cached prompt tokens measured 5× cheaper on Ollama cloud, and every batch after the first reads
+  the shared prefix from cache. Turn it off to trade cost for wall-clock time.
+
+If reviews are still slower than you want, `Review:MaxFilesPerRequest` is the lever: bigger batches
+mean fewer repeated prefixes and fewer round trips, at the risk of the model running out of output
+budget again on a big PR. Raise it gradually and watch for partial-review warnings.
+
+> **Ollama-native parameters cannot reach the model through Bifrost.** Bifrost translates to each
+> provider's schema and drops fields it does not recognise, and its passthrough endpoints cover only
+> OpenAI, Anthropic, Azure and Gemini/Vertex — not Ollama. Confirmed against a live gateway: a
+> request sent with `{ "think": false }` was logged by Bifrost as
+> `{"max_completion_tokens": …, "response_format": {"type":"json_object"}}` — the `think` field was
+> gone. `Bifrost:ExtraParameters` is therefore only useful for parameters the OpenAI schema already
+> defines.
+>
+> So for a hybrid reasoning model whose thinking you need to switch off, **use the native Ollama
+> provider rather than the gateway**. Bifrost remains the right route for everything else.
+>
+> A failure dump records the parameters this app sent (prompt omitted) above the response, so you
+> can tell "the setting never left this app" from "the gateway dropped it".
+>
+> Note that **shrinking batches does not help here**: measured on glm-5.3-flash, a batch of three
+> small files (6,020 prompt tokens) still spent all 16,384 completion tokens reasoning without
+> reaching an answer. How much this model deliberates is driven by how hard the code is, not by how
+> much of it you send — which is why `Review:MaxOutputTokens` is the lever that matters.
+
+> **If the same model works via Ollama directly but not through Bifrost**, the difference is the
+> JSON constraint: the native path sends `format: "json"`, so the gateway path must send
+> `Bifrost:ResponseFormat` (default `json_object`) to match. Because `json_object` forbids a
+> top-level array, the model answers `{"comments": [...]}` — the parser accepts that, a bare
+> array, and either wrapped in a code fence.
+
+### Why comments land on the right line
+
+Two things beyond the model's own line numbers matter here:
+
+- **The diff is taken from the PR iteration's commits**, not the branch tips: new content from the
+  iteration's source commit, old content from its `CommonRefCommit` (the merge base). Diffing
+  against the target branch *tip* instead would drag in every unrelated commit merged into the
+  target since the PR branched, and report other people's work as this PR's deletions.
+- **Comments are posted against that same iteration.** `RightFileStart` is a position on the right
+  side of a diff, and `SecondComparingIteration` declares which iteration that right side is. If
+  they disagree, Azure DevOps maps the position forward from the iteration it was told to the one
+  being displayed, and the comment drifts by however many lines were added or removed in between.
+
+Because hunk diffs are much smaller than whole files, the repository context is roughly paid for
+by the tokens they save; on this repository's own history the diff payload shrank ~38%.
+
 ---
 
 ## Project Structure
@@ -178,14 +382,21 @@ PrReviewBot/
 ├── Config/
 │   └── AppSettings.cs          # Strongly-typed configuration classes
 ├── Models/
-│   ├── PullRequestInfo.cs      # PR data model
-│   └── ReviewComment.cs        # Review comment + severity enum
+│   ├── PullRequestInfo.cs      # PR, changed files, repo context, skipped files
+│   ├── ReviewComment.cs        # Review comment + severity, evidence, confidence
+│   └── ReviewProgress.cs       # Live streaming update
 ├── Services/
 │   ├── AzureDevOpsService.cs   # Azure DevOps API integration
-│   ├── ClaudeReviewService.cs  # Anthropic Claude AI integration
-│   ├── OllamaReviewService.cs  # Ollama API integration (local or ollama.com)
-│   ├── BifrostReviewService.cs # Bifrost LLM gateway integration (OpenAI-compatible)
+│   ├── ClaudeReviewService.cs  # Anthropic Claude (official SDK)
+│   ├── OllamaReviewService.cs  # Ollama API (local or ollama.com)
+│   ├── BifrostReviewService.cs # Bifrost LLM gateway (OpenAI-compatible)
+│   ├── IReviewService.cs       # Common provider interface
+│   ├── PullRequestReviewer.cs  # Splits a PR into batches, runs them in parallel
+│   ├── DiffBuilder.cs          # Line-numbered hunk diff generation
 │   ├── ReviewHelpers.cs        # Shared review prompt + response parsing
+│   ├── ReviewValidator.cs      # Grounding checks against the real diff
+│   ├── ReviewFailedException.cs# A review that did not complete, never a silent []
+│   ├── LiveReviewDisplay.cs    # Live per-batch thinking/answer table
 │   └── ReviewOutputService.cs  # Terminal display + file output
 ├── Program.cs                  # Entry point + interactive CLI flow
 └── appsettings.json            # Configuration file
@@ -204,7 +415,17 @@ PrReviewBot/
 
 ---
 
-## Anthropic API Key Setup
+## Model Provider Setup
+
+Pick **one** provider per run; the app asks at startup.
+
+| Provider | Setup | Notes |
+|---|---|---|
+| **Claude** | [console.anthropic.com](https://console.anthropic.com/) → API key → `Claude:ApiKey` | Strongest reviews out of the box |
+| **Ollama** | Local: run `ollama serve` and set `Ollama:BaseUrl` to `http://localhost:11434/api` (no key). Cloud: key from [ollama.com](https://ollama.com) | Sends `format: "json"`, which also keeps hybrid reasoning models answering rather than thinking indefinitely |
+| **Bifrost** | Run the [gateway](https://github.com/maximhq/bifrost), set `Bifrost:BaseUrl` and a virtual key | Routes to any provider and centralises cost and usage tracking — useful when an organisation needs one place to account for AI spend |
+
+### Anthropic API Key Setup
 
 1. Sign in at [console.anthropic.com](https://console.anthropic.com/)
 2. Navigate to **API Keys** and create a new key
@@ -221,9 +442,13 @@ PrReviewBot/
 | `Microsoft.VisualStudio.Services.Client` | Azure DevOps authentication & connection |
 | `Spectre.Console` | Rich terminal UI (colors, spinners, panels) |
 | `Microsoft.Extensions.Configuration.*` | JSON + env var + user secrets config |
+| `System.Data.SqlClient` | Not used directly — pinned to `4.8.6` only to override a vulnerable transitive of the Azure DevOps 19.x clients ([GHSA-98g6-xh36-x2p7](https://github.com/advisories/GHSA-98g6-xh36-x2p7)). Drop it when moving to the 20.x clients, which use `Microsoft.Data.SqlClient` |
 
 > Ollama is accessed via plain `HttpClient` (no SDK dependency) against the
 > `/api/generate` endpoint, so it works with both local Ollama and ollama.com.
 > Bifrost is likewise accessed via plain `HttpClient` against its
 > OpenAI-compatible `/v1/chat/completions` endpoint, so any provider behind
 > the gateway works.
+>
+> Streaming is handled per transport: newline-delimited JSON for Ollama,
+> server-sent events for Bifrost, and typed stream events for the Anthropic SDK.

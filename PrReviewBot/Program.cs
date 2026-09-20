@@ -3,6 +3,7 @@ using PrReviewBot.Config;
 using PrReviewBot.Models;
 using PrReviewBot.Services;
 using Spectre.Console;
+using Spectre.Console.Rendering;
 
 IConfigurationRoot config = new ConfigurationBuilder()
     .SetBasePath(Directory.GetCurrentDirectory())
@@ -13,8 +14,9 @@ IConfigurationRoot config = new ConfigurationBuilder()
 
 AppSettings settings = config.Get<AppSettings>() ?? new AppSettings();
 
-AzureDevOpsService devOpsService = new(settings.AzureDevOps);
+AzureDevOpsService devOpsService = new(settings.AzureDevOps, settings.Review);
 ReviewOutputService outputService = new();
+ReviewValidator validator = new(settings.Review);
 
 string provider = AnsiConsole.Prompt(
     new SelectionPrompt<string>()
@@ -30,10 +32,11 @@ string providerModel = provider switch
 
 IReviewService reviewService = provider switch
 {
-    "Ollama" => new OllamaReviewService(settings.Ollama),
-    "Bifrost" => new BifrostReviewService(settings.Bifrost),
-    _ => new ClaudeReviewService(settings.Claude)
+    "Ollama" => new OllamaReviewService(settings.Ollama, settings.Review),
+    "Bifrost" => new BifrostReviewService(settings.Bifrost, settings.Review),
+    _ => new ClaudeReviewService(settings.Claude, settings.Review)
 };
+PullRequestReviewer reviewer = new(reviewService, settings.Review);
 AnsiConsole.MarkupLine($"[grey]Using {provider} ({Markup.Escape(providerModel)})[/]");
 
 AnsiConsole.Write(new FigletText("PR Review Bot").Color(Color.Blue));
@@ -134,6 +137,7 @@ foreach (PullRequestInfo pr in toReview)
     AnsiConsole.WriteLine();
 
     List<PrReviewBot.Models.ReviewComment> comments = [];
+    PullRequestReviewResult? reviewResult = null;
     await AnsiConsole.Status()
         .Spinner(Spinner.Known.Dots)
         .StartAsync($"Fetching changes for PR #{pr.Id}...", async ctx =>
@@ -141,46 +145,166 @@ foreach (PullRequestInfo pr in toReview)
             await devOpsService.LoadPrChangesAsync(pr);
         });
 
-    await AnsiConsole.Status()
-        .Spinner(Spinner.Known.Dots)
-        .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
+    if (pr.ChangedFiles.Count == 0)
+    {
+        AnsiConsole.MarkupLine(
+            $"[yellow]PR #{pr.Id} has no reviewable source changes — skipping (no API call made).[/]");
+        foreach (SkippedFile skipped in pr.SkippedFiles)
         {
-            string[] messages =
-            [
-                "The AI is staring at your diff very intensely 👀",
-                "Consulting the silicon oracle...",
-                "Generating opinions at scale 🤖",
-                "The model is judging your variable names. Quietly.",
-                "Running on vibes and matrix multiplications.",
-                "Almost done — the AI is just adding dramatic tension.",
-                "Cross-referencing your code with every Stack Overflow post ever 📚",
-                "The tokens are flowing. Wisdom may follow.",
-            ];
+            AnsiConsole.MarkupLine($"[grey]  {Markup.Escape(skipped.Path)} — {Markup.Escape(skipped.Reason)}[/]");
+        }
 
-            using CancellationTokenSource cts = new();
-            Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+        continue;
+    }
 
-            comments = await reviewService.ReviewPullRequestAsync(pr);
-            await cts.CancelAsync();
-            await tickerTask;
-        });
+    if (settings.Review.ShowThinking)
+    {
+        // Watch the model work. The reasoning counter climbing while the
+        // answer stays empty is what an exhausted output budget looks like
+        // before it fails, so this is diagnostic as well as reassuring.
+        LiveReviewDisplay display = new(settings.Review);
+        AnsiConsole.MarkupLine($"[grey]Reviewing PR #{pr.Id} with {provider} — live:[/]");
 
-    ReviewOutputService.DisplayReview(pr, comments);
+        await AnsiConsole.Live(new Table().AddColumn(" "))
+            .AutoClear(false)
+            .StartAsync(async liveCtx =>
+            {
+                using CancellationTokenSource cts = new();
+                Task painter = RepaintAsync(liveCtx, display, cts.Token);
 
-    string savedPath = outputService.SaveReviewToFile(pr, comments);
+                try
+                {
+                    reviewResult = await reviewer.ReviewAsync(
+                        pr,
+                        progress: null,
+                        liveProgress: new SynchronousProgress(display.Report),
+                        onBatchesPlanned: display.Plan,
+                        onBatchCompleted: display.Complete);
+                    comments = reviewResult.Comments;
+                }
+                finally
+                {
+                    await cts.CancelAsync();
+                    await painter;
+
+                    // One final paint so the finished state is what remains
+                    // on screen.
+                    display.TryRender(out IRenderable final);
+                    liveCtx.UpdateTarget(final);
+                    liveCtx.Refresh();
+                }
+            });
+    }
+    else
+    {
+        await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
+            {
+                string[] messages =
+                [
+                    "The AI is staring at your diff very intensely 👀",
+                    "Consulting the silicon oracle...",
+                    "Generating opinions at scale 🤖",
+                    "The model is judging your variable names. Quietly.",
+                    "Running on vibes and matrix multiplications.",
+                    "Almost done — the AI is just adding dramatic tension.",
+                    "Cross-referencing your code with every Stack Overflow post ever 📚",
+                    "The tokens are flowing. Wisdom may follow.",
+                ];
+
+                using CancellationTokenSource cts = new();
+                Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+
+                try
+                {
+                    // The PR is reviewed in batches; a batch that fails costs
+                    // its own files, not the whole review.
+                    reviewResult = await reviewer.ReviewAsync(pr, status => ctx.Status(status));
+                    comments = reviewResult.Comments;
+                }
+                finally
+                {
+                    await cts.CancelAsync();
+                    await tickerTask;
+                }
+            });
+    }
+
+    if (reviewResult is not null && reviewResult.Failures.Count != 0)
+    {
+        foreach (BatchFailure batchFailure in reviewResult.Failures)
+        {
+            AnsiConsole.MarkupLine(
+                $"\n[red]✗ Part of PR #{pr.Id} could not be reviewed:[/] {Markup.Escape(batchFailure.Exception.Message)}");
+
+            foreach (string path in batchFailure.FilePaths)
+            {
+                AnsiConsole.MarkupLine($"[grey]  not reviewed: {Markup.Escape(path)}[/]");
+            }
+
+            if (!string.IsNullOrWhiteSpace(batchFailure.Exception.RawResponse))
+            {
+                string dumpPath = outputService.SaveRawResponse(pr, batchFailure.Exception.RawResponse);
+                AnsiConsole.MarkupLine($"[grey]  raw provider response: {Markup.Escape(dumpPath)}[/]");
+            }
+        }
+
+        if (!reviewResult.AnySucceeded)
+        {
+            AnsiConsole.MarkupLine(
+                "[yellow]This PR was NOT reviewed — do not read the absence of comments as approval.[/]");
+            continue;
+        }
+
+        AnsiConsole.MarkupLine(
+            $"[yellow]Partial review: {reviewResult.UnreviewedFiles.Count} of {pr.ChangedFiles.Count} file(s) were not reviewed.[/]");
+    }
+
+    // Discard findings the diff cannot support and re-anchor the rest, before
+    // anything is shown, saved, or posted.
+    ReviewValidationResult validation = validator.Validate(pr, comments);
+    comments = validation.Kept;
+    ReviewOutputService.DisplayValidationSummary(validation);
+
+    List<string> unreviewedFiles = reviewResult?.UnreviewedFiles ?? [];
+    ReviewOutputService.DisplayReview(pr, comments, unreviewedFiles);
+
+    string savedPath = outputService.SaveReviewToFile(pr, comments, unreviewedFiles);
     AnsiConsole.MarkupLine($"[grey]📝 Review saved to: {Markup.Escape(savedPath)}[/]");
 
-    if (postComments && comments.Count != 0)
+    // Only confident findings on PR-changed lines are worth a reviewer's
+    // attention in Azure DevOps. Everything else stays in the saved report.
+    List<ReviewComment> postable =
+    [
+        .. comments.Where(c => !c.IsAdditionalObservation
+                               && c.Confidence >= settings.Review.MinConfidenceToPost)
+    ];
+
+    if (postComments && comments.Count != 0 && postable.Count != comments.Count)
+    {
+        AnsiConsole.MarkupLine(
+            $"[grey]{comments.Count - postable.Count} finding(s) kept in the report only "
+            + $"(low confidence or outside the PR's changes).[/]");
+    }
+
+    if (postComments && postable.Count != 0)
     {
         await AnsiConsole.Status()
             .StartAsync($"Posting comments for PR #{pr.Id}...", async ctx =>
             {
-                foreach (ReviewComment comment in comments.Where(c => !c.IsAdditionalObservation))
+                foreach (ReviewComment comment in postable)
                 {
                     string formatted = ReviewOutputService.FormatCommentForAzureDevOps(comment);
+
+                    // Anchor against the same iteration and file-change the
+                    // diff came from, so the line number is not re-mapped.
+                    ChangedFile? file = pr.ChangedFiles.Find(f => f.Path == comment.FilePath);
+
                     await devOpsService.PostCommentToPrAsync(
                         pr.RepositoryId, pr.Id, comment.FilePath,
-                        comment.LineNumber, formatted);
+                        comment.LineNumber, formatted,
+                        pr.LatestIterationId, file?.ChangeTrackingId ?? 0);
                 }
             });
         AnsiConsole.MarkupLine("[green]✓ Comments posted![/]");
@@ -188,6 +312,27 @@ foreach (PullRequestInfo pr in toReview)
 }
 
 AnsiConsole.MarkupLine("\n[bold green]Review complete![/]");
+
+// Repaints the live table on a timer rather than on every token. Streaming
+// delivers thousands of tiny deltas; redrawing on each one would spend more
+// time in the console than in the review.
+static Task RepaintAsync(LiveDisplayContext liveCtx, LiveReviewDisplay display, CancellationToken cancellationToken) =>
+    Task.Run(async () =>
+    {
+        try
+        {
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                if (display.TryRender(out IRenderable table))
+                {
+                    liveCtx.UpdateTarget(table);
+                }
+
+                await Task.Delay(120, cancellationToken);
+            }
+        }
+        catch (OperationCanceledException) { }
+    }, cancellationToken);
 
 // Starts a background ticker that updates ctx.Status with rotating funny
 // messages after a 5-second grace period. Stops cleanly when cancellationToken
@@ -208,3 +353,12 @@ static Task StartFunnyTickerAsync(StatusContext ctx, string[] messages, Cancella
         }
         catch (OperationCanceledException) { }
     }, cancellationToken);
+
+
+// Reports synchronously on the calling thread. Progress<T> would marshal each
+// update through the synchronization context, reordering a stream that is only
+// meaningful in order.
+internal sealed class SynchronousProgress(Action<ReviewProgress> handler) : IProgress<ReviewProgress>
+{
+    public void Report(ReviewProgress value) => handler(value);
+}

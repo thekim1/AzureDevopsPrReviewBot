@@ -1,4 +1,4 @@
-﻿using System.Globalization;
+using System.Globalization;
 using System.Text;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
 using Microsoft.VisualStudio.Services.Common;
@@ -13,11 +13,18 @@ public class AzureDevOpsService
     private const string RefsHeadsPrefix = "refs/heads/";
 
     private readonly AzureDevOpsSettings _settings;
+    private readonly ReviewSettings _reviewSettings;
     private readonly VssConnection _connection;
 
-    public AzureDevOpsService(AzureDevOpsSettings settings)
+    // Repository conventions are identical for every PR in a repo, so they are
+    // fetched once per (repo, target branch) per run instead of per PR.
+    private readonly Dictionary<string, List<RepoContextFile>> _repoContextCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    public AzureDevOpsService(AzureDevOpsSettings settings, ReviewSettings? reviewSettings = null)
     {
         _settings = settings;
+        _reviewSettings = reviewSettings ?? new ReviewSettings();
         VssBasicCredential credentials = new(string.Empty, settings.PersonalAccessToken);
         _connection = new VssConnection(new Uri(settings.OrganizationUrl), credentials);
     }
@@ -86,19 +93,103 @@ public class AzureDevOpsService
         return result;
     }
 
-    // Lazily fetch the diff for a single selected PR and populate its
-    // ChangedFiles. Call this only for PRs the user chose to review.
+    // Lazily fetch everything the reviewer needs for a single selected PR:
+    // the diff, the existing comment threads, and the repository's own
+    // convention documents. Call this only for PRs the user chose to review.
     public async Task LoadPrChangesAsync(PullRequestInfo pr)
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
-        pr.ChangedFiles = await GetPrChangesAsync(
-            gitClient, pr.RepositoryId, pr.Id,
-            RefsHeadsPrefix + pr.SourceBranch, RefsHeadsPrefix + pr.TargetBranch);
+        (List<ChangedFile> files, List<SkippedFile> skipped, int iterationId) = await GetPrChangesAsync(
+            gitClient, pr.RepositoryId, pr.Id, RefsHeadsPrefix + pr.TargetBranch);
+        pr.ChangedFiles = files;
+        pr.SkippedFiles = skipped;
+        pr.LatestIterationId = iterationId;
         pr.ExistingComments = await GetPrCommentsAsync(gitClient, pr.RepositoryId, pr.Id);
+
+        if (_reviewSettings.IncludeRepoContext)
+        {
+            pr.RepoContext = await GetRepoContextAsync(gitClient, pr.RepositoryId, pr.TargetBranch);
+        }
+    }
+
+    // Reads the repository's own instructions — agent files (AGENTS.md,
+    // CLAUDE.md, copilot-instructions.md), architecture notes, README and the
+    // build/style configuration — from the PR's target branch. Without these
+    // the model reviews against generic best practice and flags deliberate
+    // project conventions as defects.
+    private async Task<List<RepoContextFile>> GetRepoContextAsync(
+        GitHttpClient gitClient, string repoId, string targetBranch)
+    {
+        string cacheKey = $"{repoId}@{targetBranch}";
+        if (_repoContextCache.TryGetValue(cacheKey, out List<RepoContextFile>? cached))
+        {
+            return cached;
+        }
+
+        List<RepoContextFile> result = [];
+        int budget = _reviewSettings.MaxRepoContextChars;
+
+        GitVersionDescriptor version = new()
+        {
+            Version = targetBranch,
+            VersionType = GitVersionType.Branch
+        };
+
+        foreach (RepoContextGroup group in _reviewSettings.RepoContextFileGroups)
+        {
+            if (budget <= 0)
+            {
+                break;
+            }
+
+            // First hit wins: the alternatives within a group are different
+            // names for the same kind of document, not extra information.
+            foreach (string path in group.Paths)
+            {
+                string content;
+                try
+                {
+                    content = await ReadStreamAsync(gitClient, repoId, path, version);
+                }
+                catch
+                {
+                    // File simply does not exist in this repo — expected for
+                    // most of the candidate list, so not worth reporting.
+                    continue;
+                }
+
+                if (string.IsNullOrWhiteSpace(content))
+                {
+                    continue;
+                }
+
+                int limit = Math.Min(_reviewSettings.MaxRepoContextFileChars, budget);
+                bool truncated = content.Length > limit;
+                if (truncated)
+                {
+                    content = content[..limit];
+                }
+
+                budget -= content.Length;
+                result.Add(new RepoContextFile
+                {
+                    Path = path,
+                    Content = content,
+                    IsTruncated = truncated
+                });
+                break;
+            }
+        }
+
+        _repoContextCache[cacheKey] = result;
+        return result;
     }
 
     // Fetches existing comment threads on the PR so the reviewer is aware of
     // feedback someone else has already left (e.g. decisions, questions).
+    // System-generated threads ("X voted", "updated the source branch") and
+    // deleted comments are excluded — they are pure noise in the prompt and
+    // make the model think a concern was raised when none was.
     private async Task<List<PrComment>> GetPrCommentsAsync(GitHttpClient gitClient, string repoId, int prId)
     {
         List<PrComment> result = [];
@@ -109,14 +200,26 @@ public class AzureDevOpsService
 
             foreach (GitPullRequestCommentThread? thread in threads)
             {
-                if (thread.Comments is null)
+                if (thread.Comments is null || thread.IsDeleted == true)
                 {
                     continue;
                 }
 
                 foreach (Comment? c in thread.Comments)
                 {
-                    string content = c?.Content ?? "";
+                    if (c is null || c.IsDeleted == true)
+                    {
+                        continue;
+                    }
+
+                    // Only human/bot prose. System comments are Azure DevOps
+                    // activity records, not review feedback.
+                    if (c.CommentType is CommentType.System)
+                    {
+                        continue;
+                    }
+
+                    string content = c.Content ?? "";
                     if (string.IsNullOrWhiteSpace(content))
                     {
                         continue;
@@ -124,7 +227,7 @@ public class AzureDevOpsService
 
                     result.Add(new PrComment
                     {
-                        Author = c?.Author?.DisplayName ?? "Unknown",
+                        Author = c.Author?.DisplayName ?? "Unknown",
                         Content = content,
                         FilePath = thread.ThreadContext?.FilePath,
                         LineNumber = thread.ThreadContext?.RightFileStart?.Line
@@ -140,11 +243,12 @@ public class AzureDevOpsService
         return result;
     }
 
-    private async Task<List<ChangedFile>> GetPrChangesAsync(
-        GitHttpClient gitClient, string repoId, int prId,
-        string sourceRefName, string targetRefName)
+    private async Task<(List<ChangedFile> Files, List<SkippedFile> Skipped, int IterationId)> GetPrChangesAsync(
+        GitHttpClient gitClient, string repoId, int prId, string targetRefName)
     {
         List<ChangedFile> result = [];
+        List<SkippedFile> skipped = [];
+        int iterationId = 1;
         try
         {
             List<GitPullRequestIteration> iterations = await gitClient.GetPullRequestIterationsAsync(
@@ -152,29 +256,79 @@ public class AzureDevOpsService
 
             if (iterations.Count == 0)
             {
-                return result;
+                return (result, skipped, iterationId);
             }
 
             GitPullRequestIteration latestIteration = iterations.OrderByDescending(i => i.Id).First();
+            iterationId = latestIteration.Id!.Value;
+
+            // Diff the exact commits this iteration refers to, never the
+            // branch tips. Two reasons:
+            //  * CommonRefCommit is the merge base — the same base Azure
+            //    DevOps diffs against. Using the target branch tip instead
+            //    drags in every unrelated commit merged into the target since
+            //    the PR branched, which the reviewer then reports as defects.
+            //  * SourceRefCommit pins the new-file line numbers to the
+            //    iteration we are reviewing. The source branch tip can move
+            //    between listing the changes and reading the content, which
+            //    silently shifts every line number.
+            GitVersionDescriptor sourceVersion = CommitVersion(latestIteration.SourceRefCommit?.CommitId)
+                ?? BranchVersion(targetRefName);
+            GitVersionDescriptor baseVersion = CommitVersion(latestIteration.CommonRefCommit?.CommitId)
+                ?? BranchVersion(targetRefName);
 
             GitPullRequestIterationChanges changes = await gitClient.GetPullRequestIterationChangesAsync(
-                _settings.Project, repoId, prId, latestIteration.Id!.Value);
+                _settings.Project, repoId, prId, iterationId);
 
-            foreach (GitPullRequestChange? change in changes.ChangeEntries.Take(20))
+            List<GitPullRequestChange> entries = [.. changes.ChangeEntries];
+
+            foreach (GitPullRequestChange? change in entries)
             {
                 string? filePath = change.Item?.Path;
-                if (string.IsNullOrEmpty(filePath) || !IsCodeFile(filePath))
+                if (string.IsNullOrEmpty(filePath))
                 {
                     continue;
                 }
 
-                string diff = await GetFileDiffAsync(
-                    gitClient, repoId, filePath, change.ChangeType, sourceRefName, targetRefName);
+                if (change.Item?.IsFolder == true)
+                {
+                    continue;
+                }
+
+                if (!IsCodeFile(filePath))
+                {
+                    skipped.Add(new SkippedFile { Path = filePath, Reason = "not a reviewable source file" });
+                    continue;
+                }
+
+                if (result.Count >= _reviewSettings.MaxFilesPerPr)
+                {
+                    skipped.Add(new SkippedFile
+                    {
+                        Path = filePath,
+                        Reason = $"over the {_reviewSettings.MaxFilesPerPr}-file review limit"
+                    });
+                    continue;
+                }
+
+                DiffBuilder.DiffResult diff = await GetFileDiffAsync(
+                    gitClient, repoId, filePath, change.ChangeType,
+                    sourceVersion, baseVersion, _reviewSettings);
+
+                if (!diff.Success)
+                {
+                    skipped.Add(new SkippedFile { Path = filePath, Reason = diff.FailureReason });
+                    continue;
+                }
+
                 result.Add(new ChangedFile
                 {
                     Path = filePath,
                     ChangeType = change.ChangeType.ToString(),
-                    Diff = diff
+                    Diff = diff.Text,
+                    IsTruncated = diff.IsTruncated,
+                    NewFileLineCount = diff.NewFileLineCount,
+                    ChangeTrackingId = change.ChangeTrackingId
                 });
             }
         }
@@ -183,47 +337,62 @@ public class AzureDevOpsService
             Console.WriteLine($"Warning: Could not get changes for PR #{prId}: {ex.Message}");
         }
 
-        return result;
+        return (result, skipped, iterationId);
     }
 
-    private async Task<string> GetFileDiffAsync(
+    private static GitVersionDescriptor? CommitVersion(string? commitId)
+        => string.IsNullOrEmpty(commitId)
+            ? null
+            : new GitVersionDescriptor { Version = commitId, VersionType = GitVersionType.Commit };
+
+    private static GitVersionDescriptor BranchVersion(string refName)
+        => new() { Version = refName.Replace(RefsHeadsPrefix, ""), VersionType = GitVersionType.Branch };
+
+    private static async Task<DiffBuilder.DiffResult> GetFileDiffAsync(
         GitHttpClient gitClient, string repoId, string filePath,
-        VersionControlChangeType changeType, string sourceRefName, string targetRefName)
+        VersionControlChangeType changeType,
+        GitVersionDescriptor sourceVersion, GitVersionDescriptor baseVersion,
+        ReviewSettings reviewSettings)
     {
+        string oldContent = "";
+        string newContent = "";
+
+        bool isAdd = changeType.HasFlag(VersionControlChangeType.Add);
+        bool isDelete = changeType.HasFlag(VersionControlChangeType.Delete);
+
         try
         {
-            string oldContent = "";
-            string newContent = "";
-
-            bool isAdd = changeType.HasFlag(VersionControlChangeType.Add);
-            bool isDelete = changeType.HasFlag(VersionControlChangeType.Delete);
-
             if (!isDelete)
             {
-                GitVersionDescriptor sourceVersion = new()
-                {
-                    Version = sourceRefName.Replace(RefsHeadsPrefix, ""),
-                    VersionType = GitVersionType.Branch
-                };
                 newContent = await ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
             }
+        }
+        catch (Exception ex)
+        {
+            return DiffBuilder.DiffResult.Failed($"could not read the new version ({ex.GetType().Name})");
+        }
 
+        try
+        {
             if (!isAdd)
             {
-                GitVersionDescriptor targetVersion = new()
-                {
-                    Version = targetRefName.Replace(RefsHeadsPrefix, ""),
-                    VersionType = GitVersionType.Branch
-                };
-                oldContent = await ReadStreamAsync(gitClient, repoId, filePath, targetVersion);
+                oldContent = await ReadStreamAsync(gitClient, repoId, filePath, baseVersion);
             }
-
-            return GenerateUnifiedDiff(oldContent, newContent);
         }
         catch
         {
-            return "[Could not retrieve file diff]";
+            // A rename or copy leaves no file at this path in the merge base.
+            // Treating it as an addition is correct and shows the whole new
+            // file, which is what a reviewer needs anyway.
+            oldContent = "";
         }
+
+        if (DiffBuilder.LooksBinary(newContent) || DiffBuilder.LooksBinary(oldContent))
+        {
+            return DiffBuilder.DiffResult.Failed("binary content");
+        }
+
+        return DiffBuilder.Build(oldContent, newContent, reviewSettings);
     }
 
     private static async Task<string> ReadStreamAsync(
@@ -234,73 +403,6 @@ public class AzureDevOpsService
         return await reader.ReadToEndAsync();
     }
 
-    // Generates a line-numbered diff. Every line is annotated with the line
-    // number it has in the relevant file version, so the LLM can return
-    // accurate "lineNumber" values that map directly to the new file.
-    //
-    // Format:  <sign><lineNumber> | <content>
-    //   sign = '+' added (lineNumber is the NEW file line)
-    //   sign = '-' removed (lineNumber is the OLD file line)
-    //   sign = ' ' unchanged (lineNumber is the NEW file line)
-    private static string GenerateUnifiedDiff(string oldContent, string newContent)
-    {
-        const int maxLines = 300;
-        string[] oldLines = oldContent.Length == 0 ? [] : oldContent.Split('\n');
-        string[] newLines = newContent.Length == 0 ? [] : newContent.Split('\n');
-
-        if (oldLines.Length > maxLines)
-        {
-            oldLines = oldLines[..maxLines];
-        }
-
-        if (newLines.Length > maxLines)
-        {
-            newLines = newLines[..maxLines];
-        }
-
-        List<(char op, string line, int oldNum, int newNum)> diff = ComputeLineDiff(oldLines, newLines);
-
-        StringBuilder sb = new();
-        foreach ((char op, string? line, int oldNum, int newNum) in diff)
-        {
-            string num = op == '-' ? oldNum.ToString(CultureInfo.InvariantCulture) : newNum.ToString(CultureInfo.InvariantCulture);
-            sb.AppendLine(CultureInfo.InvariantCulture, $"{op}{num,5} | {line}");
-        }
-
-        return sb.ToString();
-    }
-
-    private static List<(char op, string line, int oldNum, int newNum)> ComputeLineDiff(string[] oldLines, string[] newLines)
-    {
-        int m = oldLines.Length, n = newLines.Length;
-        int[,] dp = new int[m + 1, n + 1];
-
-        for (int i = 1; i <= m; i++)
-        {
-            for (int j = 1; j <= n; j++)
-            {
-                dp[i, j] = oldLines[i - 1] == newLines[j - 1]
-                    ? dp[i - 1, j - 1] + 1
-                    : Math.Max(dp[i - 1, j], dp[i, j - 1]);
-            }
-        }
-
-        List<(char, string, int, int)> result = new(m + n);
-        int x = m, y = n;
-        while (x > 0 || y > 0)
-        {
-            if (x > 0 && y > 0 && oldLines[x - 1] == newLines[y - 1])
-            { result.Add((' ', oldLines[x - 1], x, y)); x--; y--; }
-            else if (y > 0 && (x == 0 || dp[x, y - 1] >= dp[x - 1, y]))
-            { result.Add(('+', newLines[y - 1], 0, y)); y--; }
-            else
-            { result.Add(('-', oldLines[x - 1], x, 0)); x--; }
-        }
-
-        result.Reverse();
-        return result;
-    }
-
     private async Task<Guid> GetCurrentUserIdAsync()
     {
         // Fix CS1061: GetSelfAsync doesn't exist on IdentityHttpClient in v19
@@ -309,8 +411,11 @@ public class AzureDevOpsService
         return _connection.AuthorizedIdentity.Id;
     }
 
+    // iterationId/changeTrackingId must describe the SAME iteration the diff
+    // was taken from — see the comment on the thread context below.
     public async Task PostCommentToPrAsync(
-    string repoId, int prId, string filePath, int? line, string comment)
+        string repoId, int prId, string filePath, int? line, string comment,
+        int iterationId = 1, int changeTrackingId = 0)
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
 
@@ -331,15 +436,31 @@ public class AzureDevOpsService
                     RightFileEnd = new CommentPosition { Line = line.Value, Offset = 1 }
                 },
 
-                // PullRequestThreadContext (GitPullRequestCommentThreadContext) holds iteration info
-                // Required for inline comments to render correctly in Azure DevOps UI
+                // PullRequestThreadContext tells Azure DevOps which iteration
+                // the line number is expressed in. RightFileStart refers to the
+                // "after" side, i.e. SecondComparingIteration.
+                //
+                // This used to hardcode SecondComparingIteration = 1, while the
+                // diff being reviewed came from the LATEST iteration. Azure
+                // DevOps therefore took the line number as an iteration-1
+                // coordinate and tracked it forward to the current view,
+                // shifting every comment by the net lines added or removed in
+                // the pushes since — which is why comments landed further and
+                // further off the more the author pushed. Passing the real
+                // iteration keeps the coordinate space we actually reviewed.
                 PullRequestThreadContext = new GitPullRequestCommentThreadContext
                 {
-                    ChangeTrackingId = 1,
+                    // GitPullRequestChange exposes this as int while the thread
+                    // context takes a short; clamp rather than wrap silently.
+                    ChangeTrackingId = changeTrackingId is > 0 and <= short.MaxValue
+                        ? (short)changeTrackingId
+                        : (short)0,
                     IterationContext = new CommentIterationContext
                     {
                         FirstComparingIteration = 1,
-                        SecondComparingIteration = 1
+                        SecondComparingIteration = iterationId is > 0 and <= short.MaxValue
+                            ? (short)iterationId
+                            : (short)1
                     }
                 }
             };

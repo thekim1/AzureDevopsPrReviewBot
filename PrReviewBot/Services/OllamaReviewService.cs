@@ -15,15 +15,22 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
 {
     private readonly OllamaSettings _settings;
     private readonly HttpClient _httpClient;
+    private readonly int _maxOutputTokens;
+    private readonly bool _scopeCommentsToBatch;
+    private readonly bool _stream;
 
     private static readonly JsonSerializerOptions _responseJsonOptions = new()
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public OllamaReviewService(OllamaSettings settings)
+    public OllamaReviewService(OllamaSettings settings, ReviewSettings? reviewSettings = null)
     {
         _settings = settings;
+        ReviewSettings review = reviewSettings ?? new ReviewSettings();
+        _maxOutputTokens = review.MaxOutputTokens;
+        _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
+        _stream = review.ShowThinking;
 
         HttpClientHandler handler = new();
         _httpClient = new HttpClient(handler)
@@ -41,17 +48,25 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
         }
     }
 
-    public async Task<List<ReviewComment>> ReviewPullRequestAsync(PullRequestInfo pr)
+    public async Task<List<ReviewComment>> ReviewPullRequestAsync(
+        PullRequestInfo pr,
+        IReadOnlyList<ChangedFile> files,
+        IProgress<ReviewProgress>? progress = null,
+        CancellationToken cancellationToken = default)
     {
-        string prompt = ReviewHelpers.BuildReviewPrompt(pr);
+        string prompt = ReviewHelpers.BuildReviewPrompt(pr, files, _scopeCommentsToBatch);
 
         object requestBody = new
         {
             model = _settings.Model,
             system = ReviewHelpers.SystemPrompt,
             prompt,
-            stream = false,
-            format = "json"
+            stream = _stream,
+            // Constrains generation to valid JSON, which also stops a hybrid
+            // reasoning model emitting a thinking block instead of an answer.
+            format = "json",
+            // Analytical task — randomness here produces invented findings.
+            options = new { temperature = 0, num_predict = _maxOutputTokens }
         };
 
         StringContent content = new(
@@ -59,16 +74,110 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
             Encoding.UTF8,
             "application/json");
 
-        HttpResponseMessage response = await _httpClient.PostAsync("generate", content);
+        if (_stream)
+        {
+            return await ReviewStreamingAsync(content, progress, cancellationToken);
+        }
+
+        HttpResponseMessage response = await _httpClient.PostAsync("generate", content, cancellationToken);
         response.EnsureSuccessStatusCode();
 
-        string responseJson = await response.Content.ReadAsStringAsync();
+        string responseJson = await response.Content.ReadAsStringAsync(cancellationToken);
 
         OllamaGenerateResponse? result =
             JsonSerializer.Deserialize<OllamaGenerateResponse>(responseJson, _responseJsonOptions);
 
         string text = result?.Response ?? "";
+
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            throw new ReviewFailedException(
+                $"{_settings.Model} returned an empty response"
+                + (string.IsNullOrWhiteSpace(result?.DoneReason) ? "" : $" (done_reason=\"{result.DoneReason}\")")
+                + $". If it was cut off, raise Review:MaxOutputTokens (currently {_maxOutputTokens}).",
+                responseJson);
+        }
+
         return ReviewHelpers.ParseReviewResponse(text);
+    }
+
+    // Ollama streams newline-delimited JSON rather than server-sent events:
+    // one object per line, each carrying the next fragment in `response` (and
+    // `thinking` for a reasoning model), ending with `"done": true`.
+    private async Task<List<ReviewComment>> ReviewStreamingAsync(
+        StringContent content,
+        IProgress<ReviewProgress>? progress,
+        CancellationToken cancellationToken)
+    {
+        using HttpRequestMessage request = new(HttpMethod.Post, "generate") { Content = content };
+        using HttpResponseMessage response = await _httpClient.SendAsync(
+            request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        response.EnsureSuccessStatusCode();
+
+        StringBuilder answer = new();
+        StringBuilder reasoning = new();
+        string? doneReason = null;
+
+        using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
+        using StreamReader reader = new(stream);
+
+        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line))
+            {
+                continue;
+            }
+
+            OllamaGenerateResponse? chunk;
+            try
+            {
+                chunk = JsonSerializer.Deserialize<OllamaGenerateResponse>(line, _responseJsonOptions);
+            }
+            catch (JsonException)
+            {
+                // A partial frame is not worth abandoning a review over.
+                continue;
+            }
+
+            if (chunk is null)
+            {
+                continue;
+            }
+
+            doneReason ??= chunk.DoneReason;
+
+            if (!string.IsNullOrEmpty(chunk.Thinking))
+            {
+                reasoning.Append(chunk.Thinking);
+                progress?.Report(new ReviewProgress(
+                    0, reasoning.Length, answer.Length, chunk.Thinking, IsAnswer: false));
+            }
+
+            if (!string.IsNullOrEmpty(chunk.Response))
+            {
+                answer.Append(chunk.Response);
+                progress?.Report(new ReviewProgress(
+                    0, reasoning.Length, answer.Length, chunk.Response, IsAnswer: true));
+            }
+        }
+
+        if (answer.Length == 0)
+        {
+            if (ReviewHelpers.TryFindCommentArray(reasoning.ToString(), out List<ReviewComment>? salvaged))
+            {
+                Console.WriteLine(
+                    $"Warning: {_settings.Model} produced no answer but one was recoverable from its "
+                    + $"thinking ({salvaged.Count} finding(s)).");
+                return salvaged;
+            }
+
+            throw new ReviewFailedException(
+                $"{_settings.Model} streamed {reasoning.Length} characters of thinking but no answer"
+                + (string.IsNullOrWhiteSpace(doneReason) ? "" : $" (done_reason=\"{doneReason}\")")
+                + $". Raise Review:MaxOutputTokens (currently {_maxOutputTokens}).");
+        }
+
+        return ReviewHelpers.ParseReviewResponse(answer.ToString());
     }
 
     public void Dispose()
@@ -80,5 +189,12 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
     {
         [JsonPropertyName("response")]
         public string? Response { get; set; }
+
+        [JsonPropertyName("done_reason")]
+        public string? DoneReason { get; set; }
+
+        // Reasoning models expose their thinking separately from the answer.
+        [JsonPropertyName("thinking")]
+        public string? Thinking { get; set; }
     }
 }

@@ -1,4 +1,4 @@
-﻿namespace PrReviewBot.Models;
+namespace PrReviewBot.Models;
 
 public class PullRequestInfo
 {
@@ -19,6 +19,21 @@ public class PullRequestInfo
     // Existing comments already made on the PR (fetched lazily). Passed to
     // the LLM as context so it can avoid duplicating or contradicting feedback.
     public List<PrComment> ExistingComments { get; set; } = [];
+    // Repository conventions (agent instructions, README, .editorconfig, ...)
+    // read from the target branch. Tells the reviewer what "correct" looks
+    // like in *this* codebase instead of guessing from generic best practice.
+    public List<RepoContextFile> RepoContext { get; set; } = [];
+    // Files that were changed by the PR but deliberately not sent for review
+    // (binary, too large, diff failed). Listed in the prompt so the model
+    // knows its view of the change is incomplete and does not reason about
+    // what it cannot see.
+    public List<SkippedFile> SkippedFiles { get; set; } = [];
+
+    // The PR iteration the diff was actually taken from. Comments must be
+    // posted against this same iteration, or Azure DevOps re-maps their line
+    // numbers from whichever iteration it was told and the comment lands on
+    // the wrong line.
+    public int LatestIterationId { get; set; } = 1;
 }
 
 public class ChangedFile
@@ -27,6 +42,31 @@ public class ChangedFile
     public string ChangeType { get; set; } = "";
     public string Diff { get; set; } = "";
     public string FileType => Path.Split('.').LastOrDefault() ?? "";
+    // True when the emitted diff was cut short. Surfaced to the model so it
+    // does not report "the method is never closed" on a file we cut off.
+    public bool IsTruncated { get; set; }
+    // Line count of the file on the source branch, for the same reason.
+    public int NewFileLineCount { get; set; }
+
+    // Azure DevOps' own identifier for this file's change within the
+    // iteration. It is what lets the server track the file across iterations;
+    // posting a comment with the wrong one misplaces it.
+    public int ChangeTrackingId { get; set; }
+}
+
+// A convention/architecture document read from the repository's target branch.
+public class RepoContextFile
+{
+    public string Path { get; set; } = "";
+    public string Content { get; set; } = "";
+    public bool IsTruncated { get; set; }
+}
+
+// A changed file that was intentionally excluded from the review prompt.
+public class SkippedFile
+{
+    public string Path { get; set; } = "";
+    public string Reason { get; set; } = "";
 }
 
 // An existing comment already made on the PR by someone else. Sent to the
