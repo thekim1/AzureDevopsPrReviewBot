@@ -1,0 +1,30 @@
+name: Build
+
+# Catches a broken build on master or in a PR, before anyone tags a release.
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  workflow_dispatch:
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Restore
+        run: dotnet restore PrReviewBot.slnx
+
+      - name: Build
+        run: dotnet build PrReviewBot.slnx --configuration Release --no-restore

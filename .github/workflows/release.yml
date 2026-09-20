@@ -1,0 +1,126 @@
+name: Release
+
+# Releases come from tags: push v1.2.3 and this builds every platform and
+# attaches the zips to a GitHub Release. The manual trigger exists so the
+# packaging can be smoke-tested from the Actions tab without burning a version
+# number - a manual run stops at the uploaded artifacts.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for a manual build (no Release is published)'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  package:
+    name: Package ${{ matrix.rid }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            exe: PrReviewBot.exe
+          - rid: linux-x64
+            exe: PrReviewBot
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="${{ inputs.version }}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building version $VERSION"
+
+      # Self-contained and single-file: the user unzips and runs, with no .NET
+      # install. Not trimmed - the Azure DevOps client and Spectre.Console both
+      # resolve types by reflection, which a trimmer cannot see.
+      - name: Publish
+        run: |
+          dotnet publish PrReviewBot/PrReviewBot.csproj \
+            --configuration Release \
+            --runtime "${{ matrix.rid }}" \
+            --self-contained true \
+            -p:PublishSingleFile=true \
+            -p:IncludeNativeLibrariesForSelfExtract=true \
+            -p:DebugType=none \
+            -p:Version="${{ steps.version.outputs.version }}" \
+            --output "publish/${{ matrix.rid }}"
+
+      # The zip holds only what the user needs: the executable, the settings
+      # file they must edit, the docs, and the folder their reviews land in.
+      - name: Stage zip contents
+        run: |
+          STAGE="stage/PrReviewBot"
+          mkdir -p "$STAGE/reviews"
+          cp "publish/${{ matrix.rid }}/${{ matrix.exe }}" "$STAGE/"
+          cp PrReviewBot/appsettings.json "$STAGE/"
+          cp README.md LICENSE "$STAGE/"
+          cp packaging/SETUP.txt "$STAGE/SETUP.txt"
+          cp packaging/reviews-README.txt "$STAGE/reviews/README.txt"
+          ls -lR "$STAGE"
+
+      - name: Create zip
+        id: zip
+        run: |
+          NAME="PrReviewBot-${{ steps.version.outputs.version }}-${{ matrix.rid }}.zip"
+          # zip preserves the executable bit, so the Linux binary runs straight
+          # after unzip on any tool that honours unix permissions.
+          chmod +x "stage/PrReviewBot/${{ matrix.exe }}"
+          (cd stage && zip -r "../$NAME" PrReviewBot)
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrReviewBot-${{ matrix.rid }}
+          path: ${{ steps.zip.outputs.name }}
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    runs-on: ubuntu-latest
+    if: github.ref_type == 'tag'
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.zip
+          generate_release_notes: true
+          body: |
+            Download the zip for your platform, unpack it, then follow
+            `SETUP.txt` - fill in `appsettings.json` before the first run.
+
+            | File | Platform |
+            |---|---|
+            | `...-win-x64.zip` | Windows (Intel/AMD) |
+            | `...-linux-x64.zip` | Linux (Intel/AMD), including WSL |
+
+            Both builds are self-contained: no .NET runtime install needed.

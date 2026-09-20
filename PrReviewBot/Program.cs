@@ -5,9 +5,15 @@ using PrReviewBot.Services;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
+// The released zip ships appsettings.json next to the executable, so that copy
+// is the one the user edits and it has to be found however the tool is
+// launched. A second, optional file in the working directory stays supported so
+// one install can be pointed at different organisations from different folders.
 IConfigurationRoot config = new ConfigurationBuilder()
-    .SetBasePath(Directory.GetCurrentDirectory())
+    .SetBasePath(AppContext.BaseDirectory)
     .AddJsonFile("appsettings.json", optional: false)
+    .AddJsonFile(
+        Path.Combine(Directory.GetCurrentDirectory(), "appsettings.json"), optional: true)
     .AddUserSecrets<Program>(optional: true)
     .AddEnvironmentVariables()
     .Build();

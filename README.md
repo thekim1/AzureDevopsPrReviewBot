@@ -33,7 +33,7 @@ one. See [Review accuracy](#review-accuracy).
 
 | Requirement | Notes |
 |---|---|
-| [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Runtime and build toolchain |
+| [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Only to build from source — the [prebuilt downloads](#option-a-download-a-release-no-net-needed) bundle their own runtime |
 | Azure DevOps account | With access to the target project |
 | Azure DevOps PAT | Personal Access Token with `Code (Read)` and `Code (Write)` scopes |
 | A model provider | **One** of: an [Anthropic API key](https://console.anthropic.com/), an [Ollama](https://ollama.com) instance (local needs no key), or a [Bifrost](https://github.com/maximhq/bifrost) gateway |
@@ -42,16 +42,57 @@ one. See [Review accuracy](#review-accuracy).
 
 ## Getting Started
 
-### 1. Clone the repository
+### Option A: Download a release (no .NET needed)
+
+Grab the zip for your platform from the
+[latest release](https://github.com/thekim1/AzureDevopsPrReviewBot/releases/latest):
+
+| File | Platform |
+|---|---|
+| `PrReviewBot-<version>-win-x64.zip` | Windows (Intel/AMD) |
+| `PrReviewBot-<version>-linux-x64.zip` | Linux (Intel/AMD), including WSL |
+
+Unpack it and you get the executable, the `appsettings.json` you need to edit, this README,
+and the `reviews/` folder your saved reviews land in. The builds are self-contained, so there
+is no runtime to install.
+
+```bash
+# Linux
+unzip PrReviewBot-1.0.0-linux-x64.zip
+cd PrReviewBot
+nano appsettings.json    # see Configure settings, below
+chmod +x PrReviewBot     # only if the executable bit did not survive the unzip
+./PrReviewBot
+```
+
+On Windows, unpack the zip, edit `appsettings.json`, then run `PrReviewBot.exe`.
+
+`appsettings.json` is read from the folder holding the executable, so the tool works from any
+working directory. A second `appsettings.json` in the directory you launch from is layered on
+top if present, which lets one install serve several organisations.
+
+Then fill in [Configure settings](#configure-settings) below.
+
+### Option B: Build from source
+
+Needs the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 
 ```bash
 git clone https://github.com/thekim1/AzureDevopsPrReviewBot.git
 cd AzureDevopsPrReviewBot
 ```
 
-### 2. Configure settings
+Fill in [Configure settings](#configure-settings) below, then:
 
-Open `PrReviewBot/appsettings.json` and fill in your values:
+```bash
+cd PrReviewBot
+dotnet run
+```
+
+### Configure settings
+
+Open `appsettings.json` — next to the executable in a downloaded release, or
+`PrReviewBot/appsettings.json` in a source checkout — and fill in your values:
 
 ```json
 {
@@ -88,22 +129,16 @@ At startup the app asks which provider to use (**Claude**, **Ollama**, or **Bifr
 
 **Bifrost** ([maximhq/bifrost](https://github.com/maximhq/bifrost)) is an LLM gateway that routes to any provider. Models are addressed as `provider/model`, e.g. `anthropic/claude-sonnet-4-5` or `openai/gpt-4o`.
 
-### 3. Build and run
-
-```bash
-cd PrReviewBot
-dotnet run
-```
-
 ---
 
 ## Configuration
 
 The app loads configuration from the following sources in order (later sources override earlier ones):
 
-1. `appsettings.json`
-2. [.NET User Secrets](#using-net-user-secrets-recommended)
-3. Environment variables
+1. `appsettings.json` next to the executable — the copy shipped in a release zip
+2. `appsettings.json` in the directory you launch from, if one exists there
+3. [.NET User Secrets](#using-net-user-secrets-recommended)
+4. Environment variables
 
 ### Configuration Reference
 

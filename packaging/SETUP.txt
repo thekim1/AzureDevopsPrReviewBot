@@ -1,0 +1,35 @@
+PR Review Bot - read this before running
+========================================
+
+1. Open appsettings.json in this folder and fill in:
+
+     AzureDevOps.OrganizationUrl   https://dev.azure.com/YOUR_ORG
+     AzureDevOps.Project           your project name
+     AzureDevOps.PersonalAccessToken
+         Azure DevOps > User settings > Personal access tokens.
+         Needs Code (Read) and Code (Write).
+     AzureDevOps.ReviewerEmail     the address your PRs are assigned to
+
+   Then fill in ONE model provider:
+
+     Claude.ApiKey    from https://console.anthropic.com/
+     Ollama           BaseUrl + Model (a local Ollama needs no key)
+     Bifrost          BaseUrl + Model of your gateway
+
+   You choose which provider to use each time the tool starts, so there is no
+   harm in configuring more than one.
+
+2. Run it.
+
+     Windows:  double-click PrReviewBot.exe, or run it from a terminal
+     Linux:    chmod +x PrReviewBot   (once, if it is not already executable)
+               ./PrReviewBot
+
+   No .NET install is needed - the runtime is inside the executable.
+
+3. Reviews are saved as markdown files in the reviews/ folder.
+
+appsettings.json holds an access token and an API key. Keep this folder
+somewhere only you can read, and do not commit it anywhere.
+
+Full documentation is in README.md.
