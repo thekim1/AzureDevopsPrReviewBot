@@ -47,6 +47,8 @@ public class ChangedFile
     public bool IsTruncated { get; set; }
     // Line count of the file on the source branch, for the same reason.
     public int NewFileLineCount { get; set; }
+    // True when the diff contains every line of the file, not just hunks.
+    public bool IsWholeFile { get; set; }
 
     // Azure DevOps' own identifier for this file's change within the
     // iteration. It is what lets the server track the file across iterations;

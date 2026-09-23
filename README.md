@@ -168,12 +168,19 @@ tuned so the prompt is *more* useful without being bigger — see [Review accura
 | Key | Default | Description |
 |---|---|---|
 | `Review:ContextLines` | `12` | Unchanged lines kept either side of a change. The main accuracy dial: too few and the model invents "missing" null checks that live just outside the window |
-| `Review:MaxFilesPerPr` | `20` | Files reviewed per PR; the rest are listed as explicitly not shown |
+| `Review:WholeFileMaxLines` | `300` | Files up to this many lines are sent whole rather than as hunks — the one view where the model may rely on what is absent from a file |
+| `Review:ScopeMaxLines` | `120` | Each change in a larger file is widened to its enclosing block (method, if-block, template element) when that block is at most this many lines. `0` = context lines only |
+| `Review:FileHeaderLines` | `30` | Opening lines of every file not sent whole — imports, type declaration, injected fields, constructor. For `.vue`, counted from the `<script>` block. `0` = off |
+| `Review:MaxFilesPerPr` | `20` | Files reviewed per PR. Over the limit, source is kept first, then configuration, tests, styles and docs; the rest are listed as explicitly not shown |
+| `Review:ExcludedPaths` | `[]` | Extra globs never to review, on top of the built-in lockfiles, generated, minified, binary and vendored files. `**` spans folders, `*` stays in one; no leading `/` matches at any depth. E.g. `["**/Generated/**", "/src/api-client/**"]` |
 | `Review:MaxFilesPerRequest` | `4` | Files per request. A PR is reviewed in several requests — see [Large pull requests](#large-pull-requests) |
 | `Review:MaxDiffCharsPerRequest` | `30000` | Second bound on a request, so one huge file cannot fill a batch past the file-count limit |
 | `Review:ShowThinking` | `true` | Stream the model's output and show a live table of what each batch is thinking and answering. Supported by all three providers. Usage is still reported to the gateway, so cost tracking is unaffected. Set `false` for the plain spinner |
 | `Review:ThinkingPreviewChars` | `220` | How much of the current thought to keep on screen per batch |
 | `Review:MaxParallelRequests` | `3` | Batches in flight at once. Keep it at or below the gateway's upstream connection limit — for Bifrost that is the provider's `max_conns_per_host` — or the surplus requests just queue |
+| `Review:MaxParallelDevOpsRequests` | `8` | File reads and listings in flight against Azure DevOps at once, across everything being loaded. Lower it if Azure DevOps starts throttling |
+| `Review:StreamIdleTimeoutSeconds` | `180` | A streamed request whose model produces no output for this long is abandoned and its batch reported as failed. Keep-alive heartbeats do not count as output |
+| `Review:MaxRequestMinutes` | `15` | Hard limit on one request, start to finish — catches a model that trickles output slowly enough to never trip the idle timeout |
 | `Review:WarmPrefixCache` | `true` | Run the first batch alone so the shared prefix lands in the provider's prompt cache before the rest go out. Costs ~one round trip, makes every later batch far cheaper. Set `false` to favour speed over cost |
 | `Review:ScopeExistingCommentsToBatch` | `true` | Send only the existing PR comments that concern the batch's own files (plus PR-level ones) |
 | `Review:MaxDiffLinesPerFile` | `400` | Cap on emitted diff lines per file, applied after hunking |
@@ -267,10 +274,14 @@ the saved report but are not posted to Azure DevOps (see `Review:MinConfidenceTo
 Most false positives in an LLM code review come from the model reasoning about code it was never
 shown. Four things keep that in check:
 
-1. **Hunk diffs, not whole files.** Only changed regions plus `ContextLines` of surrounding code
-   are sent, and omitted stretches are marked `@@ ... N unchanged line(s) not shown ... @@`.
-   Files that are too large to diff safely are reported as *not reviewed* rather than diffed on a
-   truncated prefix — a truncated prefix makes the entire tail of a file look deleted.
+1. **The right amount of each file.** Small files (`WholeFileMaxLines`) are sent whole and marked
+   as complete. In larger files each change is widened to the block it sits in — the whole method
+   rather than a fixed window, which is where the "missing" null check or dispose usually turns out
+   to be — plus the file's opening lines (imports, fields, constructor). Omitted stretches are
+   marked `@@ ... N unchanged line(s) not shown ... @@`. If widening would exceed
+   `MaxDiffLinesPerFile`, the file falls back to plain `ContextLines` hunks rather than cutting
+   changes off. Files that are too large to diff safely are reported as *not reviewed* rather than
+   diffed on a truncated prefix — a truncated prefix makes the entire tail of a file look deleted.
 2. **Repository context.** The reviewed repo's own `AGENTS.md` / `CLAUDE.md` /
    `copilot-instructions.md`, architecture notes, README and `.editorconfig` are read from the PR's
    **target branch** and marked authoritative, so a deliberate project convention is not reported
@@ -281,7 +292,8 @@ shown. Four things keep that in check:
    refers to. After the response comes back, each quote is looked up in the diff that was actually
    sent. Findings on files that are not in the PR, or quoting code that was never shown, are
    discarded; a quote that *is* found also fixes the comment's line number, so comments land on
-   the right line in Azure DevOps. This costs no tokens.
+   the right line in Azure DevOps. When the quoted line occurs more than once, an exact match wins,
+   then the occurrence nearest the line the model named. This costs no tokens.
 
 The terminal prints what was filtered on each run, so you can tell a quiet model from an
 over-aggressive filter.
@@ -348,8 +360,14 @@ budget ran out. That same PR now splits into six requests of 2.5k–29k characte
 Batching also makes failure partial: a batch that fails costs its own files, and the run says
 exactly which files went unreviewed instead of silently returning fewer findings.
 
+**Related files share a batch.** A class travels with its interface and its tests (`Foo.cs`,
+`IFoo.cs`, `FooTests.cs`), and batches are filled folder by folder, so the request that sees a
+changed signature usually also sees its callers.
+
 Batches are **independent requests, so they run concurrently** (`Review:MaxParallelRequests`).
-Running them one after another would just multiply wall-clock time by the batch count.
+Running them one after another would just multiply wall-clock time by the batch count. The
+smallest batch goes first (it warms the cache, and the others wait on it), then the rest largest
+first, so the slowest request is never the one left to start last.
 
 The cost of batching is that every request repeats the same prefix — system prompt, repository
 context, PR metadata. Three things keep that in check:

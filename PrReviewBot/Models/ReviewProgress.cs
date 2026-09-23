@@ -11,7 +11,8 @@ public sealed record ReviewProgress(
     int ReasoningChars,
     int AnswerChars,
     string? LatestText,
-    bool IsAnswer)
+    bool IsAnswer,
+    int PromptChars = 0)
 {
     // Rough token estimate for display only; the authoritative count comes from
     // the provider's usage block.

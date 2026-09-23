@@ -147,4 +147,69 @@ public class PullRequestReviewerTests
         Assert.Equal([["/a"], ["/b"], ["/c"]], planned.Select(b => b.FilePaths.ToArray()));
         Assert.Equal([0, 1, 2], completed.Order());
     }
+
+    private sealed class ThrowingReviewService(Func<IReadOnlyList<ChangedFile>, CancellationToken, Task<List<ReviewComment>>> behaviour) : IReviewService
+    {
+        public Task<List<ReviewComment>> ReviewPullRequestAsync(
+            PullRequestInfo pr, IReadOnlyList<ChangedFile> files,
+            IProgress<ReviewProgress>? progress = null, CancellationToken cancellationToken = default)
+            => behaviour(files, cancellationToken);
+    }
+
+    [Fact]
+    public async Task HttpErrorFailsOnlyItsOwnBatch()
+    {
+        // Used to escape the batch, and Task.WhenAll rethrew it once every
+        // other batch had finished — discarding all their results.
+        ThrowingReviewService service = new((files, _) => files[0].Path == "/b"
+            ? throw new HttpRequestException("502 Bad Gateway")
+            : Task.FromResult<List<ReviewComment>>([new ReviewComment { FilePath = files[0].Path }]));
+        PullRequestInfo pr = Pr(File("/a"), File("/b"), File("/c"));
+
+        PullRequestReviewResult result = await new PullRequestReviewer(service, Settings()).ReviewAsync(pr);
+
+        Assert.Equal(["/b"], result.UnreviewedFiles);
+        Assert.Contains("502 Bad Gateway", result.Failures[0].Exception.Message);
+        Assert.Equal(["/a", "/c"], result.Comments.Select(c => c.FilePath));
+    }
+
+    [Fact]
+    public async Task RequestThatRunsTooLongIsAbandoned()
+    {
+        ThrowingReviewService service = new(async (files, token) =>
+        {
+            await Task.Delay(files[0].Path == "/slow" ? Timeout.InfiniteTimeSpan : TimeSpan.Zero, token);
+            return [];
+        });
+        PullRequestInfo pr = Pr(File("/fast"), File("/slow"));
+
+        PullRequestReviewResult result = await new PullRequestReviewer(service, Settings(warm: false))
+        {
+            RequestTimeout = TimeSpan.FromMilliseconds(300)
+        }.ReviewAsync(pr).WaitAsync(TimeSpan.FromSeconds(10), TestContext.Current.CancellationToken);
+
+        Assert.Equal(["/slow"], result.UnreviewedFiles);
+        Assert.Contains("MaxRequestMinutes", result.Failures[0].Exception.Message);
+    }
+
+    [Fact]
+    public async Task StartOfEachBatchIsReportedWithItsPromptSize()
+    {
+        RecordingReviewService service = new();
+        PullRequestInfo pr = Pr(File("/a", 500), File("/b", 50));
+        List<ReviewProgress> updates = [];
+
+        await new PullRequestReviewer(service, Settings(warm: false)).ReviewAsync(
+            pr, liveProgress: new SyncProgress(u => { lock (updates) { updates.Add(u); } }));
+
+        Assert.Equal(2, updates.Count(u => u.PromptChars > 0));
+        int a = updates.Single(u => u.BatchIndex == 0).PromptChars;
+        int b = updates.Single(u => u.BatchIndex == 1).PromptChars;
+        Assert.True(a > b + 400, $"{a} vs {b}");
+    }
+
+    private sealed class SyncProgress(Action<ReviewProgress> handler) : IProgress<ReviewProgress>
+    {
+        public void Report(ReviewProgress value) => handler(value);
+    }
 }

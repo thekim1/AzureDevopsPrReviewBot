@@ -99,4 +99,80 @@ public class BatchPlannerTests
         List<int> all = [.. schedule.Order, schedule.WarmUpIndex!.Value];
         Assert.Equal(Enumerable.Range(0, 7), all.Order());
     }
+
+    [Theory]
+    [InlineData("/src/Api/UserService.cs", "userservice")]
+    [InlineData("/src/Api/IUserService.cs", "userservice")]
+    [InlineData("/tests/Api.Tests/UserServiceTests.cs", "userservice")]
+    [InlineData("/src/web/imageUtils.spec.ts", "imageutils")]
+    [InlineData("/src/Api/appsettings.Development.json", "appsettings")]
+    [InlineData("/src/Api/Invoice.cs", "invoice")]
+    [InlineData("/src/web/a/index.ts", "/src/web/a/index")]
+    public void RelationKeyTiesRelatedFilesTogether(string path, string expected)
+        => Assert.Equal(expected, BatchPlanner.RelationKey(path));
+
+    [Fact]
+    public void ClassInterfaceAndTestsLandInTheSameBatch()
+    {
+        ChangedFile[] files =
+        [
+            File("/src/Api/UserService.cs"),
+            File("/src/Api/OrderService.cs"),
+            File("/src/Web/Page.vue"),
+            File("/src/Api/Contracts/IUserService.cs"),
+            File("/tests/Api.Tests/UserServiceTests.cs")
+        ];
+
+        List<IReadOnlyList<ChangedFile>> batches = BatchPlanner.Split(files, maxFilesPerBatch: 3, maxDiffCharsPerBatch: 10_000);
+
+        IReadOnlyList<ChangedFile> userBatch = Assert.Single(batches, b => b.Any(f => f.Path == "/src/Api/UserService.cs"));
+        Assert.Contains(userBatch, f => f.Path == "/src/Api/Contracts/IUserService.cs");
+        Assert.Contains(userBatch, f => f.Path == "/tests/Api.Tests/UserServiceTests.cs");
+        Assert.Equal(5, batches.Sum(b => b.Count));
+    }
+
+    [Fact]
+    public void ClusterThatDoesNotFitStartsAFreshBatchInsteadOfBeingSplit()
+    {
+        ChangedFile[] files =
+        [
+            File("/src/A.cs"),
+            File("/src/B.cs"),
+            File("/src/C.cs"),
+            File("/src/ICustomer.cs"),
+            File("/src/Customer.cs")
+        ];
+
+        List<IReadOnlyList<ChangedFile>> batches = BatchPlanner.Split(files, maxFilesPerBatch: 4, maxDiffCharsPerBatch: 10_000);
+
+        Assert.Contains(batches, b => b.Select(f => f.Path).Order().SequenceEqual(["/src/Customer.cs", "/src/ICustomer.cs"]));
+    }
+
+    [Fact]
+    public void ClusterLargerThanABatchIsSplitRatherThanDropped()
+    {
+        ChangedFile[] files = [File("/src/Foo.cs"), File("/src/IFoo.cs"), File("/tests/FooTests.cs"), File("/src/Foo.razor")];
+
+        List<IReadOnlyList<ChangedFile>> batches = BatchPlanner.Split(files, maxFilesPerBatch: 2, maxDiffCharsPerBatch: 10_000);
+
+        Assert.Equal([2, 2], batches.Select(b => b.Count));
+    }
+
+    [Fact]
+    public void FilesInTheSameFolderStayAdjacent()
+    {
+        ChangedFile[] files = [File("/web/A.vue"), File("/api/X.cs"), File("/web/B.vue"), File("/api/Y.cs")];
+
+        List<IReadOnlyList<ChangedFile>> batches = BatchPlanner.Split(files, maxFilesPerBatch: 2, maxDiffCharsPerBatch: 10_000);
+
+        Assert.Equal([["/api/X.cs", "/api/Y.cs"], ["/web/A.vue", "/web/B.vue"]], batches.Select(b => b.Select(f => f.Path).ToArray()));
+    }
+
+    [Fact]
+    public void GenericNamesInDifferentFoldersAreNotGrouped()
+    {
+        ChangedFile[] files = [File("/a/index.ts"), File("/b/other.ts"), File("/c/index.ts")];
+
+        Assert.Equal(3, BatchPlanner.Cluster(files).Count);
+    }
 }

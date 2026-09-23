@@ -22,17 +22,21 @@ internal static class DiffBuilder
     // Outcome of diffing a single file. A file that cannot be diffed safely is
     // reported as a failure rather than returned as placeholder text, which
     // the model would otherwise try to review.
+    //
+    // IsWholeFile: every line of the file is in Text, so the model may rely on
+    // what is absent from it.
     public readonly record struct DiffResult(
         bool Success,
         string Text,
         bool IsTruncated,
         int NewFileLineCount,
-        string FailureReason)
+        string FailureReason,
+        bool IsWholeFile = false)
     {
         public static DiffResult Failed(string reason) => new(false, "", false, 0, reason);
     }
 
-    public static DiffResult Build(string oldContent, string newContent, ReviewSettings settings)
+    public static DiffResult Build(string oldContent, string newContent, ReviewSettings settings, string path = "")
     {
         string[] oldLines = SplitLines(oldContent);
         string[] newLines = SplitLines(newContent);
@@ -47,11 +51,32 @@ internal static class DiffBuilder
         }
 
         List<(char Op, string Line, int OldNum, int NewNum)> diff = ComputeLineDiff(oldLines, newLines);
-        List<(int Start, int End)> hunks = BuildHunks(diff, settings.ContextLines, settings.HunkMergeDistance);
 
-        if (hunks.Count == 0)
+        if (!diff.Exists(d => d.Op != ' '))
         {
             return new DiffResult(true, "(no textual changes in this file)", false, newLines.Length, "");
+        }
+
+        // A small file is sent whole. Hunks save little on it, and a complete
+        // file is the one case where the model may trust that something
+        // missing from what it sees is really missing.
+        bool wholeFile = newLines.Length <= settings.WholeFileMaxLines && diff.Count <= settings.MaxDiffLinesPerFile;
+
+        List<(int Start, int End)> hunks;
+        if (wholeFile)
+        {
+            hunks = [(0, diff.Count)];
+        }
+        else
+        {
+            // Widened hunks first. If they would blow the per-file line cap,
+            // fall back to plain context windows rather than truncating: the
+            // changes themselves matter more than the blocks around them.
+            hunks = BuildHunks(diff, newLines, settings, path, expandScopes: true);
+            if (hunks.Sum(h => h.End - h.Start) > settings.MaxDiffLinesPerFile)
+            {
+                hunks = BuildHunks(diff, newLines, settings, path, expandScopes: false);
+            }
         }
 
         StringBuilder sb = new();
@@ -103,28 +128,78 @@ internal static class DiffBuilder
                 $"@@ ... {diff.Count - previousEnd} unchanged line(s) not shown ... @@");
         }
 
-        return new DiffResult(true, sb.ToString(), truncated, newLines.Length, "");
+        return new DiffResult(true, sb.ToString(), truncated, newLines.Length, "", wholeFile && !truncated);
     }
 
-    // Returns [start, end) ranges over the diff list covering every changed
-    // line plus `context` lines on each side, merging ranges that are closer
-    // together than `mergeDistance`.
+    // Returns [start, end) ranges over the diff list that together cover:
+    //  * every changed line plus ContextLines on each side;
+    //  * with expandScopes, the enclosing block of each change (see
+    //    ScopeExpander), up to ScopeMaxLines;
+    //  * the file header — imports, namespace, type declaration, fields and
+    //    constructor — which says what every method below can rely on.
+    // Ranges closer together than HunkMergeDistance are merged.
     private static List<(int Start, int End)> BuildHunks(
-        List<(char Op, string Line, int OldNum, int NewNum)> diff, int context, int mergeDistance)
+        List<(char Op, string Line, int OldNum, int NewNum)> diff,
+        string[] newLines,
+        ReviewSettings settings,
+        string path,
+        bool expandScopes)
     {
-        List<(int Start, int End)> hunks = [];
+        int context = settings.ContextLines;
+        List<(int Start, int End)> ranges = [];
 
         for (int i = 0; i < diff.Count; i++)
         {
-            if (diff[i].Op == ' ')
+            if (diff[i].Op != ' ')
             {
-                continue;
+                ranges.Add((Math.Max(0, i - context), Math.Min(diff.Count, i + context + 1)));
+            }
+        }
+
+        // Diff position of each new-file line, for mapping new-file ranges
+        // (which is what the header and scopes are computed on) back.
+        int[] newToDiff = new int[newLines.Length];
+        for (int i = 0; i < diff.Count; i++)
+        {
+            if (diff[i].Op != '-')
+            {
+                newToDiff[diff[i].NewNum - 1] = i;
+            }
+        }
+
+        void AddNewLineRange(int first, int last)
+        {
+            if (newLines.Length == 0)
+            {
+                return;
             }
 
-            int start = Math.Max(0, i - context);
-            int end = Math.Min(diff.Count, i + context + 1);
+            first = Math.Clamp(first, 0, newLines.Length - 1);
+            last = Math.Clamp(last, first, newLines.Length - 1);
+            ranges.Add((newToDiff[first], newToDiff[last] + 1));
+        }
 
-            if (hunks.Count != 0 && start - hunks[^1].End <= mergeDistance)
+        if (expandScopes && settings.ScopeMaxLines > 0)
+        {
+            foreach ((int first, int last) in ChangedNewLineRegions(diff, newLines.Length))
+            {
+                (int wideFirst, int wideLast) = ScopeExpander.Expand(newLines, first, last, settings.ScopeMaxLines);
+                AddNewLineRange(wideFirst, wideLast);
+            }
+        }
+
+        if (settings.FileHeaderLines > 0 && newLines.Length != 0)
+        {
+            int headerStart = HeaderStart(newLines, path);
+            AddNewLineRange(headerStart, headerStart + settings.FileHeaderLines - 1);
+        }
+
+        ranges.Sort();
+
+        List<(int Start, int End)> hunks = [];
+        foreach ((int start, int end) in ranges)
+        {
+            if (hunks.Count != 0 && start - hunks[^1].End <= settings.HunkMergeDistance)
             {
                 hunks[^1] = (hunks[^1].Start, Math.Max(hunks[^1].End, end));
             }
@@ -135,6 +210,69 @@ internal static class DiffBuilder
         }
 
         return hunks;
+    }
+
+    // Each run of consecutive changed lines, as a zero-based new-file range.
+    // A run of pure deletions has no new-file lines, so it is represented by
+    // the new-file lines either side of where it was.
+    private static IEnumerable<(int First, int Last)> ChangedNewLineRegions(
+        List<(char Op, string Line, int OldNum, int NewNum)> diff, int newLineCount)
+    {
+        int i = 0;
+        while (i < diff.Count)
+        {
+            if (diff[i].Op == ' ')
+            {
+                i++;
+                continue;
+            }
+
+            int runStart = i;
+            while (i < diff.Count && diff[i].Op != ' ')
+            {
+                i++;
+            }
+
+            int first = int.MaxValue, last = -1;
+            for (int j = runStart; j < i; j++)
+            {
+                if (diff[j].Op == '+')
+                {
+                    first = Math.Min(first, diff[j].NewNum - 1);
+                    last = Math.Max(last, diff[j].NewNum - 1);
+                }
+            }
+
+            if (last < 0)
+            {
+                int before = runStart > 0 ? diff[runStart - 1].NewNum - 1 : 0;
+                int after = i < diff.Count ? diff[i].NewNum - 1 : newLineCount - 1;
+                first = Math.Max(0, before);
+                last = Math.Max(first, after);
+            }
+
+            if (newLineCount != 0)
+            {
+                yield return (first, Math.Min(last, newLineCount - 1));
+            }
+        }
+    }
+
+    // Where the useful header of a file begins. In a Vue single-file component
+    // the imports and props live in the script block, not at the top of the
+    // template.
+    private static int HeaderStart(string[] newLines, string path)
+    {
+        if (path.EndsWith(".vue", StringComparison.OrdinalIgnoreCase))
+        {
+            int script = Array.FindIndex(newLines, l => l.TrimStart().StartsWith("<script", StringComparison.OrdinalIgnoreCase));
+            if (script >= 0)
+            {
+                return script;
+            }
+        }
+
+        return 0;
     }
 
     private static string[] SplitLines(string content)

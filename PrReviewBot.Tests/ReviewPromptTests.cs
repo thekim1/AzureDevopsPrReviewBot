@@ -110,4 +110,34 @@ public class ReviewPromptTests
 
         Assert.Contains("WARNING: this diff was truncated", prompt);
     }
+
+    [Fact]
+    public void WholeFileIsAnnouncedAsComplete()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"), File("/b.cs"));
+        pr.ChangedFiles[0].IsWholeFile = true;
+
+        string prompt = ReviewHelpers.BuildReviewPrompt(pr, pr.ChangedFiles);
+
+        Assert.Contains("This is the complete file (50 lines)", prompt);
+        Assert.Contains("The full file is 50 lines; only the file's opening lines", prompt);
+        Assert.Contains("\"This is the complete file\"", ReviewHelpers.SystemPrompt);
+    }
+
+    [Fact]
+    public void SkippedFilesAreCappedPerReason()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"));
+        pr.SkippedFiles =
+        [
+            .. Enumerable.Range(0, 300).Select(i => new SkippedFile { Path = $"/img/{i}.png", Reason = "binary or media file" }),
+            new SkippedFile { Path = "/package-lock.json", Reason = "lockfile" }
+        ];
+
+        string prefix = ReviewHelpers.BuildReviewPromptParts(pr, pr.ChangedFiles).SharedPrefix;
+
+        Assert.Equal(ReviewHelpers.MaxSkippedFilesListedPerReason, prefix.Split('\n').Count(l => l.StartsWith("/img/", StringComparison.Ordinal)));
+        Assert.Contains("... and 290 more — binary or media file", prefix);
+        Assert.Contains("/package-lock.json — lockfile", prefix);
+    }
 }

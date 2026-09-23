@@ -195,7 +195,16 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
                 + $". Raise Review:MaxOutputTokens (currently {_maxOutputTokens}).");
         }
 
-        return ReviewHelpers.ParseReviewResponse(answer.ToString());
+        try
+        {
+            return ReviewHelpers.ParseReviewResponse(answer.ToString());
+        }
+        catch (ReviewFailedException ex)
+        {
+            // The answer itself is what needs looking at when it cannot be
+            // read, so it goes into the failure dump.
+            throw new ReviewFailedException(ex.Message, answer.ToString());
+        }
     }
 
     public void Dispose()

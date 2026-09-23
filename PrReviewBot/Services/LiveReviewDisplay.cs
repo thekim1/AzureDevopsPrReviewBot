@@ -72,6 +72,10 @@ public sealed class LiveReviewDisplay
             row.ReasoningChars = update.ReasoningChars;
             row.AnswerChars = update.AnswerChars;
             row.Started = true;
+            if (update.PromptChars > 0)
+            {
+                row.PromptChars = update.PromptChars;
+            }
 
             if (!string.IsNullOrEmpty(update.LatestText))
             {
@@ -127,12 +131,12 @@ public sealed class LiveReviewDisplay
     {
         const int LabelMaxWidth = 32;
         const int NumberWidth = 11;          // "~12,345 tok"
-        const int TableChrome = 5 + (4 * 2); // five borders, one space either side of each column
+        const int TableChrome = 6 + (5 * 2); // six borders, one space either side of each column
         const int FixedLines = 5;            // top border, header, separator, bottom border, one spare
 
         // In a narrow window the label gives way too, down to a stub, so the
         // fixed columns alone never force a row to wrap.
-        int available = width - TableChrome - (2 * NumberWidth);
+        int available = width - TableChrome - (3 * NumberWidth);
         int labelMax = Math.Clamp(available / 2, 6, LabelMaxWidth);
 
         List<(string Label, BatchRow Row)> shown = [];
@@ -165,6 +169,7 @@ public sealed class LiveReviewDisplay
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Grey)
             .AddColumn(new TableColumn("[grey]Part[/]").NoWrap())
+            .AddColumn(new TableColumn("[grey]Prompt[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[grey]Thinking[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[grey]Answer[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[grey]Latest thought[/]").NoWrap());
@@ -190,8 +195,13 @@ public sealed class LiveReviewDisplay
                 ? "[grey]—[/]"
                 : $"[green]{Approx(row.AnswerChars)}[/]";
 
+            // Prompt size matters for speed: a flash model slows down per
+            // token as its input grows, which looks like a stall.
+            string prompt = row.PromptChars == 0 ? "[grey]—[/]" : $"[grey]{Approx(row.PromptChars)}[/]";
+
             table.AddRow(
                 $"{status} {Markup.Escape(label)}",
+                prompt,
                 thinking,
                 answer,
                 LatestColumn(row, tailWidth));
@@ -199,7 +209,7 @@ public sealed class LiveReviewDisplay
 
         if (summary is not null)
         {
-            table.AddRow($"[green]✓[/] {Markup.Escape(summary)}", "", "", "");
+            table.AddRow($"[green]✓[/] {Markup.Escape(summary)}", "", "", "", "");
         }
 
         return table;
@@ -224,6 +234,11 @@ public sealed class LiveReviewDisplay
             return "";
         }
 
+        // The running clock comes first and ticks every second, so a frozen
+        // display — nothing repainting at all — is told apart from a slow
+        // model at a glance.
+        string clock = Duration(now - start) + " ";
+
         DateTimeOffset since = row.LastOutputAt ?? start;
         TimeSpan quiet = now - since;
         if (quiet >= QuietThreshold)
@@ -231,10 +246,10 @@ public sealed class LiveReviewDisplay
             string text = row.LastOutputAt is null
                 ? $"waiting for the model to start… {Duration(quiet)}"
                 : $"no output for {Duration(quiet)}";
-            return $"[yellow]{Markup.Escape(FitEnd(text, width))}[/]";
+            return $"[grey]{Markup.Escape(clock)}[/][yellow]{Markup.Escape(FitEnd(text, Math.Max(0, width - clock.Length)))}[/]";
         }
 
-        return $"[grey]{Markup.Escape(FitEnd(SingleLine(row.Tail), width))}[/]";
+        return $"[grey]{Markup.Escape(clock + FitEnd(SingleLine(row.Tail), Math.Max(0, width - clock.Length)))}[/]";
     }
 
     private static string Duration(TimeSpan span) => span.TotalMinutes >= 1
@@ -340,6 +355,7 @@ public sealed class LiveReviewDisplay
         public string Tail { get; set; } = "";
         public int ReasoningChars { get; set; }
         public int AnswerChars { get; set; }
+        public int PromptChars { get; set; }
         public bool Started { get; set; }
         public bool Finished { get; set; }
         public bool Failed { get; set; }

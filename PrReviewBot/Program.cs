@@ -54,9 +54,7 @@ AnsiConsole.Write(new FigletText("PR Review Bot").Color(Color.Blue));
 
 // Fetch PRs (assigned to you + others) across the project
 List<PullRequestInfo> pullRequests = [];
-await AnsiConsole.Status()
-    .Spinner(Spinner.Known.Dots)
-    .StartAsync("Fetching pull requests from Azure DevOps...", async ctx =>
+await ConsoleStatus.RunAsync("Fetching pull requests from Azure DevOps...", async ctx =>
     {
         string[] messages =
         [
@@ -153,15 +151,18 @@ for (int prIndex = 0; prIndex < toReview.Count; prIndex++)
 
     List<PrReviewBot.Models.ReviewComment> comments = [];
     PullRequestReviewResult? reviewResult = null;
-    using (DeferredConsole.Hold())
+    // Usually already loaded in the background while the previous PR was
+    // reviewed; a spinner is only shown when there is actually a wait.
+    Task loading = prefetcher.LoadAsync(prIndex);
+    if (!loading.IsCompleted)
     {
-        await AnsiConsole.Status()
-            .Spinner(Spinner.Known.Dots)
-            .StartAsync($"Fetching changes for PR #{pr.Id}...", async ctx =>
-            {
-                await prefetcher.LoadAsync(prIndex);
-            });
+        using (DeferredConsole.Hold())
+        {
+            await ConsoleStatus.RunAsync($"Fetching changes for PR #{pr.Id}...", _ => loading);
+        }
     }
+
+    await loading;
 
     if (pr.ChangedFiles.Count == 0)
     {
@@ -224,9 +225,7 @@ for (int prIndex = 0; prIndex < toReview.Count; prIndex++)
         }
         else
         {
-            await AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
+            await ConsoleStatus.RunAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
                 {
                     string[] messages =
                     [
@@ -318,8 +317,7 @@ for (int prIndex = 0; prIndex < toReview.Count; prIndex++)
 
     if (postComments && postable.Count != 0)
     {
-        await AnsiConsole.Status()
-            .StartAsync($"Posting comments for PR #{pr.Id}...", async ctx =>
+        await ConsoleStatus.RunAsync($"Posting comments for PR #{pr.Id}...", async ctx =>
             {
                 foreach (ReviewComment comment in postable)
                 {

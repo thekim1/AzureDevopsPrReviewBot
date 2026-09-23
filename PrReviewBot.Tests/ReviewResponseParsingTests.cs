@@ -45,4 +45,46 @@ public class ReviewResponseParsingTests
 
         Assert.Contains("cut off", ex.Message);
     }
+
+    [Fact]
+    public void TrailingCommaAndCommentsAreAccepted()
+        => Assert.Equal(2, ReviewHelpers.ParseReviewResponse("""
+            [
+              // first
+              {"filePath":"/a.cs","issue":"x",},
+              {"filePath":"/b.cs","issue":"y"},
+            ]
+            """).Count);
+
+    [Fact]
+    public void OneMalformedFindingDoesNotCostTheOthers()
+    {
+        // An unescaped quote inside the prose of the second finding.
+        string answer = """
+            {"comments": [
+              {"filePath":"/a.cs","lineNumber":1,"issue":"fine"},
+              {"filePath":"/b.cs","lineNumber":2,"issue":"Använd "await" här"},
+              {"filePath":"/c.cs","lineNumber":3,"issue":"also fine"}
+            ]}
+            """;
+
+        List<ReviewComment> comments = ReviewHelpers.ParseReviewResponse(answer);
+
+        Assert.Equal(["/a.cs", "/c.cs"], comments.Select(c => c.FilePath));
+    }
+
+    [Fact]
+    public void SalvageReportsHowManyFindingsWereLost()
+    {
+        Assert.True(ReviewHelpers.TrySalvageFindings(
+            """[{"filePath":"/a.cs","issue":"ok"}, {"filePath": oops}]""", out List<ReviewComment> kept, out int lost));
+
+        Assert.Single(kept);
+        Assert.Equal(1, lost);
+    }
+
+    [Fact]
+    public void SalvageNeverTreatsACutOffAnswerAsComplete()
+        => Assert.False(ReviewHelpers.TrySalvageFindings(
+            """[{"filePath":"/a.cs","issue":"ok"}, {"filePath":"/b.cs","iss""", out _, out _));
 }

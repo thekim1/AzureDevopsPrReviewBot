@@ -74,7 +74,7 @@ public sealed class ReviewValidator
                 continue;
             }
 
-            int? evidenceLine = file.FindLineByEvidence(comment.Evidence);
+            int? evidenceLine = file.FindLineByEvidence(comment.Evidence, comment.LineNumber);
 
             if (requireEvidence && evidenceLine is null)
             {
@@ -259,7 +259,10 @@ public sealed class ReviewValidator
     // line the model was shown, plus its normalised text for evidence lookup.
     private sealed class FileDiffIndex
     {
-        private readonly List<(int? NewLine, string Text)> _lines = [];
+        // AnchorLine is where a comment about the line lands: its own number
+        // for an added or unchanged line, the next new-file line for a removed
+        // one (which only has an old-file number).
+        private readonly List<(int? NewLine, int? AnchorLine, string Text)> _lines = [];
         private readonly SortedSet<int> _reviewableLines = [];
         private int _firstAddedLine = -1;
 
@@ -303,7 +306,7 @@ public sealed class ReviewValidator
                 // Removed lines carry an OLD-file number, which must never be
                 // used to anchor a comment in the new file.
                 int? newLine = op == '-' ? null : number;
-                index._lines.Add((newLine, content));
+                index._lines.Add((newLine, newLine, content));
 
                 if (newLine.HasValue)
                 {
@@ -316,13 +319,49 @@ public sealed class ReviewValidator
                 }
             }
 
+            index.AnchorRemovedLines();
             return index;
+        }
+
+        private void AnchorRemovedLines()
+        {
+            int? next = null;
+            for (int i = _lines.Count - 1; i >= 0; i--)
+            {
+                if (_lines[i].NewLine is { } line)
+                {
+                    next = line;
+                }
+                else
+                {
+                    _lines[i] = _lines[i] with { AnchorLine = next };
+                }
+            }
+
+            int? previous = null;
+            for (int i = 0; i < _lines.Count; i++)
+            {
+                if (_lines[i].NewLine is { } line)
+                {
+                    previous = line;
+                }
+                else if (_lines[i].AnchorLine is null)
+                {
+                    _lines[i] = _lines[i] with { AnchorLine = previous };
+                }
+            }
         }
 
         // Finds the line the quoted evidence came from and returns its new-file
         // number. This both proves the finding is grounded and fixes the line
         // number when the model copied the wrong one.
-        public int? FindLineByEvidence(string? evidence)
+        //
+        // With whole files and widened blocks in the diff, a common line
+        // (`return result;`, `}`) often appears several times. Taking the first
+        // match anchored comments on an unrelated occurrence far from the
+        // finding, so an exact match beats a partial one, and among equals the
+        // one nearest the line the model named wins.
+        public int? FindLineByEvidence(string? evidence, int? preferredLine = null)
         {
             if (evidence is null)
             {
@@ -340,17 +379,57 @@ public sealed class ReviewValidator
                     continue;
                 }
 
-                foreach ((int? line, string text) in _lines)
+                int? best = null;
+                int bestQuality = int.MaxValue;
+                int bestDistance = int.MaxValue;
+
+                foreach ((int? _, int? anchor, string text) in _lines)
                 {
-                    if (text.Contains(needle, StringComparison.Ordinal)
-                        || needle.Contains(text, StringComparison.Ordinal))
+                    int quality = MatchQuality(needle, text);
+                    if (quality < 0 || anchor is null)
                     {
-                        return line ?? SnapToNearestReviewableLine(null);
+                        continue;
                     }
+
+                    int distance = preferredLine is { } preferred ? Math.Abs(anchor.Value - preferred) : 0;
+                    if (quality < bestQuality || (quality == bestQuality && distance < bestDistance))
+                    {
+                        best = anchor;
+                        bestQuality = quality;
+                        bestDistance = distance;
+                    }
+                }
+
+                if (best is not null)
+                {
+                    return best;
                 }
             }
 
             return null;
+        }
+
+        // 0 exact, 1 the line contains the quote, 2 the quote contains the
+        // line, -1 no match. The last only counts for a line long enough to
+        // be distinctive: otherwise a lone `{` or `}` matches almost any quote.
+        private static int MatchQuality(string needle, string text)
+        {
+            if (text == needle)
+            {
+                return 0;
+            }
+
+            if (text.Contains(needle, StringComparison.Ordinal))
+            {
+                return 1;
+            }
+
+            if (text.Length >= Math.Max(8, needle.Length / 2) && needle.Contains(text, StringComparison.Ordinal))
+            {
+                return 2;
+            }
+
+            return -1;
         }
 
         // Moves a line number onto a line the model was actually shown. An

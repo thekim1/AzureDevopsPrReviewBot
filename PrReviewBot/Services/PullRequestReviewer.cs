@@ -25,7 +25,11 @@ public sealed class PullRequestReviewer
     {
         _reviewService = reviewService;
         _settings = settings;
+        RequestTimeout = TimeSpan.FromMinutes(Math.Max(1, settings.MaxRequestMinutes));
     }
+
+    // Review:MaxRequestMinutes as a span; settable so tests need not wait a minute.
+    internal TimeSpan RequestTimeout { get; init; }
 
     public async Task<PullRequestReviewResult> ReviewAsync(
         PullRequestInfo pr,
@@ -69,19 +73,41 @@ public sealed class PullRequestReviewer
                     ? null
                     : new BatchStampedProgress(liveProgress, index);
 
-                // Marks the batch as sent. Until the first token arrives the
-                // display would otherwise show it as still queued, which looks
-                // the same as a request stuck waiting on the provider.
-                batchProgress?.Report(new ReviewProgress(index, 0, 0, null, IsAnswer: false));
+                // Marks the batch as sent, with the size of what is being sent.
+                // Until the first token arrives the display would otherwise
+                // show it as still queued, which looks the same as a request
+                // stuck waiting on the provider.
+                int promptChars = ReviewHelpers.SystemPrompt.Length
+                    + ReviewHelpers.BuildReviewPrompt(pr, batch, _settings.ScopeExistingCommentsToBatch).Length;
+                batchProgress?.Report(new ReviewProgress(index, 0, 0, null, IsAnswer: false, promptChars));
 
-                results[index] = await _reviewService.ReviewPullRequestAsync(
-                    pr, batch, batchProgress);
+                using CancellationTokenSource deadline = new(RequestTimeout);
+                try
+                {
+                    results[index] = await _reviewService.ReviewPullRequestAsync(
+                        pr, batch, batchProgress, deadline.Token);
+                }
+                catch (OperationCanceledException) when (deadline.IsCancellationRequested)
+                {
+                    throw new ReviewFailedException(string.Create(CultureInfo.InvariantCulture,
+                        $"the request was still running after {RequestTimeout.TotalMinutes:0.#} minute(s) and was abandoned (Review:MaxRequestMinutes)."));
+                }
             }
             catch (ReviewFailedException ex)
             {
                 // Keep the batches that did work. Losing a few files is a far
                 // better outcome than losing the review.
                 batchFailures[index] = new BatchFailure([.. batch.Select(f => f.Path)], ex);
+            }
+            catch (Exception ex)
+            {
+                // An HTTP error, a timeout waiting for response headers, a
+                // provider exception: all of them cost this batch, not the run.
+                // Left uncaught, one of these took down every other batch's
+                // results with it once Task.WhenAll rethrew it.
+                batchFailures[index] = new BatchFailure(
+                    [.. batch.Select(f => f.Path)],
+                    new ReviewFailedException($"{ex.GetType().Name}: {ex.Message}", ex));
             }
             finally
             {

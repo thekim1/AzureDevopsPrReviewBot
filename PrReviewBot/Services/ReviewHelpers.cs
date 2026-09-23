@@ -58,6 +58,12 @@ internal static class ReviewHelpers
         If you cannot prove a defect from the text in front of you, do not report it.
         Reporting nothing is a correct and acceptable answer.
 
+        One narrow exception: a file introduced with "This is the complete file" is shown in
+        full, so within THAT file you may rely on what is absent — e.g. a field that is never
+        disposed, a variable never assigned in this file. It says nothing about other files:
+        callers, registrations, tests and definitions elsewhere in the repository are still
+        unseen.
+
         ## Project conventions beat generic best practice
 
         The input may include a "REPOSITORY CONTEXT" section with the repository's own agent
@@ -133,11 +139,18 @@ internal static class ReviewHelpers
             { "comments": [ ...the comments... ] }
         """;
 
+    // Models write JSON the way people do: a trailing comma after the last
+    // finding, the odd // comment. Neither changes the meaning, and rejecting
+    // them threw away answers that had cost minutes of thinking.
     private static readonly JsonSerializerOptions _jsonOptions = new()
     {
         PropertyNameCaseInsensitive = true,
+        AllowTrailingCommas = true,
+        ReadCommentHandling = JsonCommentHandling.Skip,
         Converters = { new JsonStringEnumConverter(JsonNamingPolicy.CamelCase, allowIntegerValues: false) }
     };
+
+    internal const int MaxSkippedFilesListedPerReason = 10;
 
     public static string BuildReviewPrompt(
         PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true)
@@ -192,9 +205,23 @@ internal static class ReviewHelpers
         {
             shared.AppendLine();
             shared.AppendLine("=== FILES CHANGED BUT NOT SHOWN TO YOU (do not reason about these, and do not comment on them) ===");
-            foreach (SkippedFile skipped in pr.SkippedFiles)
+
+            // Grouped by reason and capped. A PR that touches hundreds of
+            // images or generated files would otherwise repeat every one of
+            // them in every batch — a prompt that size slows a model down to
+            // a crawl, and the list tells it nothing a count does not.
+            foreach (IGrouping<string, SkippedFile> group in pr.SkippedFiles.GroupBy(f => f.Reason))
             {
-                shared.AppendLine(CultureInfo.InvariantCulture, $"{skipped.Path} — {skipped.Reason}");
+                foreach (SkippedFile skipped in group.Take(MaxSkippedFilesListedPerReason))
+                {
+                    shared.AppendLine(CultureInfo.InvariantCulture, $"{skipped.Path} — {skipped.Reason}");
+                }
+
+                int more = group.Count() - MaxSkippedFilesListedPerReason;
+                if (more > 0)
+                {
+                    shared.AppendLine(CultureInfo.InvariantCulture, $"... and {more} more — {group.Key}");
+                }
             }
         }
 
@@ -231,10 +258,15 @@ internal static class ReviewHelpers
         foreach (ChangedFile file in files)
         {
             batch.AppendLine(CultureInfo.InvariantCulture, $"=== FILE: {file.Path} ({file.ChangeType}) ===");
-            if (file.NewFileLineCount > 0)
+            if (file.IsWholeFile && file.NewFileLineCount > 0)
             {
                 batch.AppendLine(CultureInfo.InvariantCulture,
-                    $"The full file is {file.NewFileLineCount} lines; only changed regions and nearby context are shown below.");
+                    $"This is the complete file ({file.NewFileLineCount} lines), with the PR's changes marked. Nothing in this file is hidden from you.");
+            }
+            else if (file.NewFileLineCount > 0)
+            {
+                batch.AppendLine(CultureInfo.InvariantCulture,
+                    $"The full file is {file.NewFileLineCount} lines; only the file's opening lines, the changed regions and the blocks around them are shown below.");
             }
 
             if (file.IsTruncated)
@@ -304,6 +336,16 @@ internal static class ReviewHelpers
             return found;
         }
 
+        // A complete answer with one malformed finding in it — typically an
+        // unescaped quote inside Swedish prose or a code example. Keep the
+        // findings that do read rather than failing the whole batch.
+        if (TrySalvageFindings(text, out List<ReviewComment> salvaged, out int unreadable))
+        {
+            DeferredConsole.WriteLine(string.Create(CultureInfo.InvariantCulture,
+                $"Warning: the model's answer was not valid JSON as a whole; {salvaged.Count} finding(s) were recovered and {unreadable} could not be read."));
+            return salvaged;
+        }
+
         string hint = text.StartsWith('[') && !text.EndsWith(']')
             ? " The array is unterminated, so the answer was cut off — raise Review:MaxOutputTokens."
             : "";
@@ -359,10 +401,71 @@ internal static class ReviewHelpers
         return false;
     }
 
+    // Reads the findings of a complete comments array one at a time.
+    //
+    // Only for an answer whose array is closed: a cut-off answer is a failure
+    // (the model ran out of budget, and more findings were coming), and must
+    // not pass for a finished review with a few findings.
+    internal static bool TrySalvageFindings(string text, out List<ReviewComment> comments, out int unreadable)
+    {
+        comments = [];
+        unreadable = 0;
+
+        int arrayStart = text.IndexOf('[', StringComparison.Ordinal);
+        if (arrayStart < 0)
+        {
+            return false;
+        }
+
+        int arrayEnd = FindMatchingClose(text, arrayStart);
+        if (arrayEnd < 0)
+        {
+            return false;
+        }
+
+        int i = arrayStart + 1;
+        while ((i = text.IndexOf('{', i)) >= 0 && i < arrayEnd)
+        {
+            int close = FindMatchingClose(text, i);
+            if (close < 0 || close > arrayEnd)
+            {
+                unreadable++;
+                break;
+            }
+
+            try
+            {
+                ReviewComment? comment = JsonSerializer.Deserialize<ReviewComment>(text[i..(close + 1)], _jsonOptions);
+                if (comment is not null && !string.IsNullOrWhiteSpace(comment.FilePath))
+                {
+                    comments.Add(comment);
+                }
+                else
+                {
+                    unreadable++;
+                }
+            }
+            catch (JsonException)
+            {
+                unreadable++;
+            }
+
+            i = close + 1;
+        }
+
+        return comments.Count != 0;
+    }
+
     // Walks forward from an opening bracket to its match, honouring JSON string
     // literals and escapes so brackets inside strings do not confuse it.
     private static int FindMatchingBracket(string text, int openIndex)
+        => text[openIndex] == '[' ? FindMatchingClose(text, openIndex) : -1;
+
+    // The index of the bracket or brace that closes the one at openIndex, or
+    // -1 when it is never closed or closed by the wrong kind.
+    private static int FindMatchingClose(string text, int openIndex)
     {
+        char expected = text[openIndex] == '[' ? ']' : '}';
         int depth = 0;
         bool inString = false;
         bool escaped = false;
@@ -403,7 +506,7 @@ internal static class ReviewHelpers
                     depth--;
                     if (depth == 0)
                     {
-                        return c == ']' ? i : -1;
+                        return c == expected ? i : -1;
                     }
 
                     break;

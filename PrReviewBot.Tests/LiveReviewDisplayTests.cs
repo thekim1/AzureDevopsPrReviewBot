@@ -94,7 +94,9 @@ public class LiveReviewDisplayTests
 
         clock.Now += TimeSpan.FromSeconds(42);
 
-        Assert.Contains("waiting for the model to start… 42s", RowText(display));
+        string text = RowText(display);
+        Assert.Contains("waiting for the model to start… 42s", text);
+        Assert.Contains("42s waiting", text);
     }
 
     [Fact]
@@ -167,4 +169,21 @@ public class LiveReviewDisplayTests
     [Fact]
     public void FitEndLeavesShortTextAlone()
         => Assert.Equal("short", LiveReviewDisplay.FitEnd("short", 20));
+
+    [Fact]
+    public void RunningPartShowsPromptSizeAndATickingClock()
+    {
+        ManualClock clock = new();
+        LiveReviewDisplay display = new(new ReviewSettings(), clock);
+        display.Plan([new BatchInfo(0, ["/a.cs"])]);
+        display.Report(new ReviewProgress(0, 0, 0, null, IsAnswer: false, PromptChars: 48_000));
+        clock.Now += TimeSpan.FromSeconds(3);
+        display.Report(new ReviewProgress(0, 400, 0, "thinking about it", IsAnswer: false));
+        clock.Now += TimeSpan.FromSeconds(2);
+
+        string text = RowText(display);
+
+        Assert.Contains("~12,000 tok", text);
+        Assert.Contains("5s thinking about it", text);
+    }
 }

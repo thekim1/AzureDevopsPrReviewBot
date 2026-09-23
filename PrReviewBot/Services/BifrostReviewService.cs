@@ -302,6 +302,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
             $"{{\"streamed\": true, \"finish_reason\": {JsonSerializer.Serialize(finishReason)}, "
             + $"\"usage\": {usageJson ?? "null"}, "
             + $"\"content_length\": {answer.Length}, \"reasoning_length\": {reasoning.Length}, "
+            + $"\"content\": {JsonSerializer.Serialize(answer.ToString())}, "
             + $"\"reasoning_content\": {JsonSerializer.Serialize(reasoning.ToString())}}}");
 
         if (answer.Length == 0)

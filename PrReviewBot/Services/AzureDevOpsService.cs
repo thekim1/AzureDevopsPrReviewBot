@@ -17,6 +17,11 @@ public class AzureDevOpsService
     // number of results per call when no page size is given.
     private const int PullRequestPageSize = 500;
 
+    // Page size for a PR iteration's change list. The API returns 100 changes
+    // when none is given, so on a larger PR every file after the hundredth was
+    // silently missing — not reviewed, and not listed as skipped either.
+    private const int ChangePageSize = 1000;
+
     private readonly AzureDevOpsSettings _settings;
     private readonly ReviewSettings _reviewSettings;
     private readonly VssConnection _connection;
@@ -315,12 +320,14 @@ public class AzureDevOpsService
             GitVersionDescriptor baseVersion = CommitVersion(latestIteration.CommonRefCommit?.CommitId)
                 ?? BranchVersion(targetRefName);
 
-            GitPullRequestIterationChanges changes = await gitClient.GetPullRequestIterationChangesAsync(
-                _settings.Project, repoId, prId, iterationId);
+            List<GitPullRequestChange> changes = await ConcurrencyHelpers.ReadAllPagesAsync(
+                ChangePageSize,
+                async (skip, top) => (await gitClient.GetPullRequestIterationChangesAsync(
+                    _settings.Project, repoId, prId, iterationId, top: top, skip: skip)).ChangeEntries?.ToList() ?? []);
 
             List<GitPullRequestChange> candidates = [];
 
-            foreach (GitPullRequestChange? change in changes.ChangeEntries)
+            foreach (GitPullRequestChange? change in changes)
             {
                 string? filePath = change.Item?.Path;
                 if (string.IsNullOrEmpty(filePath))
@@ -333,14 +340,20 @@ public class AzureDevOpsService
                     continue;
                 }
 
-                if (!IsCodeFile(filePath))
+                string? exclusion = FileClassifier.ExclusionReason(filePath, _reviewSettings.ExcludedPaths);
+                if (exclusion is not null)
                 {
-                    skipped.Add(new SkippedFile { Path = filePath, Reason = "not a reviewable source file" });
+                    skipped.Add(new SkippedFile { Path = filePath, Reason = exclusion });
                     continue;
                 }
 
                 candidates.Add(change);
             }
+
+            // When there are more files than the limit, the ones cut are the
+            // least important: source first, then configuration, tests,
+            // styles and documentation.
+            candidates = FileClassifier.RankByPriority(candidates, c => c.Item.Path);
 
             // Diffs are fetched concurrently, but the files accepted are the
             // same ones, in the same order, as reading them one by one up to
@@ -370,6 +383,7 @@ public class AzureDevOpsService
                     Diff = diff.Text,
                     IsTruncated = diff.IsTruncated,
                     NewFileLineCount = diff.NewFileLineCount,
+                    IsWholeFile = diff.IsWholeFile,
                     ChangeTrackingId = change.ChangeTrackingId
                 });
             }
@@ -466,7 +480,7 @@ public class AzureDevOpsService
             return DiffBuilder.DiffResult.Failed("binary content");
         }
 
-        return DiffBuilder.Build(oldContent, newContent, _reviewSettings);
+        return DiffBuilder.Build(oldContent, newContent, _reviewSettings, filePath);
     }
 
     private async Task<string> ReadStreamAsync(
@@ -560,17 +574,5 @@ public class AzureDevOpsService
         // Fix CS1744: CreateThreadAsync signature is (thread, repositoryId, pullRequestId, project)
         // project is a named param that must NOT also be given positionally
         await gitClient.CreateThreadAsync(thread, repoId, prId, _settings.Project);
-    }
-
-    private static bool IsCodeFile(string? path)
-    {
-        if (string.IsNullOrEmpty(path))
-        {
-            return false;
-        }
-
-        string[] codeExtensions = [ ".cs", ".vue", ".ts", ".js", ".tsx", ".jsx",
-            ".json", ".yaml", ".yml", ".xml", ".csproj", ".razor", ".html", ".css", ".scss", ".esproj" ];
-        return codeExtensions.Any(ext => path.EndsWith(ext, StringComparison.OrdinalIgnoreCase));
     }
 }

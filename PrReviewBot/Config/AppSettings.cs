@@ -98,7 +98,28 @@ public class ReviewSettings
     // sees two near-identical blocks separated by a pointless gap marker.
     public int HunkMergeDistance { get; set; } = 8;
 
+    // Files up to this many lines are sent whole instead of as hunks. Hunks
+    // save little on a small file, and a complete file is the one view where
+    // the model can trust that something it does not see is really not there.
+    public int WholeFileMaxLines { get; set; } = 300;
+
+    // Each change in a larger file is widened to the block it sits in — the
+    // whole method, if-block or template element — as long as that block is
+    // at most this many lines. 0 turns it off and leaves only ContextLines.
+    public int ScopeMaxLines { get; set; } = 120;
+
+    // The first lines of every file not sent whole: imports, namespace, type
+    // declaration, injected fields and constructor. For a .vue file, counted
+    // from the <script> block. 0 turns it off.
+    public int FileHeaderLines { get; set; } = 30;
+
     public int MaxFilesPerPr { get; set; } = 20;
+
+    // Extra paths never to review, on top of the built-in lockfiles,
+    // generated, minified, binary and vendored files. Globs: `**` spans
+    // folders, `*` stays within one; a pattern without a leading slash matches
+    // at any depth. Example: ["**/Generated/**", "/src/api-client/**", "*.sql"].
+    public List<string> ExcludedPaths { get; set; } = [];
 
     // A PR is reviewed in several requests of at most this many files. One
     // request per PR does not survive a large change: the model must take in
@@ -193,6 +214,14 @@ public class ReviewSettings
     // stretch in a healthy request is the wait for the first token — which
     // includes queueing behind other requests at the gateway.
     public int StreamIdleTimeoutSeconds { get; set; } = 180;
+
+    // Hard limit on one request from start to finish, whatever it is doing.
+    // The idle timeout only catches a request that goes silent; this catches
+    // one that trickles — a token every few seconds keeps the idle timeout
+    // happy and would take hours to exhaust the output budget. Set well above
+    // the slowest healthy request (about 3.5 minutes measured on glm-5.3-flash
+    // with 19k tokens of thinking).
+    public int MaxRequestMinutes { get; set; } = 15;
 
     // How many characters of the model's thinking to keep on screen per batch.
     public int ThinkingPreviewChars { get; set; } = 220;
