@@ -2,6 +2,9 @@ using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
+using Microsoft.TeamFoundation.WorkItemTracking.WebApi;
+using WorkItem = Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models.WorkItem;
+using WorkItemErrorPolicy = Microsoft.TeamFoundation.WorkItemTracking.WebApi.Models.WorkItemErrorPolicy;
 using Microsoft.VisualStudio.Services.Common;
 using Microsoft.VisualStudio.Services.WebApi;
 using PrReviewBot.Config;
@@ -37,6 +40,24 @@ public class AzureDevOpsService
     // including a PR being prefetched while another is loading. Reading files
     // one at a time was most of the wait before a review could start.
     private readonly SemaphoreSlim _readGate;
+
+    // Folder listings, per repo, branch and folder. PRs in the same repo share
+    // most of their folders, and each listing is a round trip.
+    private readonly ConcurrentDictionary<string, Lazy<Task<string[]>>> _listingCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // The repository's full file list, per repo and branch, for resolving
+    // referenced definitions. One call per repo for the whole run.
+    private readonly ConcurrentDictionary<string, Lazy<Task<string[]>>> _treeCache =
+        new(StringComparer.OrdinalIgnoreCase);
+
+    // A PAT without Work Items (Read) fails every lookup the same way; saying
+    // so once is enough.
+    private int _workItemWarningShown;
+
+    // More folders than this between the root and the changed files are not
+    // searched for conventions; the nearest ones are.
+    private const int MaxScopedDirectories = 40;
 
     public AzureDevOpsService(AzureDevOpsSettings settings, ReviewSettings? reviewSettings = null)
     {
@@ -142,15 +163,51 @@ public class AzureDevOpsService
             ? GetRepoContextAsync(gitClient, pr.RepositoryId, pr.TargetBranch)
             : null;
 
+        Task<List<LinkedWorkItem>>? workItemsTask = _reviewSettings.IncludeWorkItems
+            ? GetWorkItemsAsync(gitClient, pr.RepositoryId, pr.Id)
+            : null;
+        Task<List<string>>? commitsTask = _reviewSettings.IncludeCommitMessages
+            ? GetCommitMessagesAsync(gitClient, pr.RepositoryId, pr.Id)
+            : null;
+
         (List<ChangedFile> files, List<SkippedFile> skipped, int iterationId) = await changesTask;
         pr.ChangedFiles = files;
         pr.SkippedFiles = skipped;
         pr.LatestIterationId = iterationId;
+
+        // These depend on which files changed, so they start once those are known.
+        Task<List<RepoContextFile>>? scopedTask = _reviewSettings.IncludeScopedContext && files.Count != 0
+            ? GetScopedContextAsync(gitClient, pr.RepositoryId, pr.TargetBranch, files.Select(f => f.Path))
+            : null;
+        Task<List<ReferencedDefinition>>? definitionsTask = _reviewSettings.IncludeReferencedDefinitions && files.Count != 0
+            ? GetReferencedDefinitionsAsync(gitClient, pr.RepositoryId, pr.TargetBranch, files, skipped)
+            : null;
+
         pr.ExistingComments = await commentsTask;
 
         if (contextTask is not null)
         {
             pr.RepoContext = await contextTask;
+        }
+
+        if (workItemsTask is not null)
+        {
+            pr.WorkItems = await workItemsTask;
+        }
+
+        if (commitsTask is not null)
+        {
+            pr.CommitMessages = await commitsTask;
+        }
+
+        if (scopedTask is not null)
+        {
+            pr.ScopedContext = await scopedTask;
+        }
+
+        if (definitionsTask is not null)
+        {
+            pr.ReferencedDefinitions = await definitionsTask;
         }
     }
 
@@ -190,6 +247,179 @@ public class AzureDevOpsService
 
         return RepoContextPlanner.Assemble(
             fetched, _reviewSettings.MaxRepoContextChars, _reviewSettings.MaxRepoContextFileChars);
+    }
+
+    // Convention files from the folders between the root and the changed
+    // files, nearest first, within their own budget.
+    private async Task<List<RepoContextFile>> GetScopedContextAsync(
+        GitHttpClient gitClient, string repoId, string targetBranch, IEnumerable<string> changedPaths)
+    {
+        GitVersionDescriptor version = new() { Version = targetBranch, VersionType = GitVersionType.Branch };
+
+        List<string> directories = [.. RepoContextPlanner.AncestorDirectories(changedPaths).Take(MaxScopedDirectories)];
+
+        string[][] listings = await Task.WhenAll(directories.Select(dir =>
+            _listingCache.GetOrAdd(
+                $"{repoId}@{targetBranch}:{dir}",
+                _ => new Lazy<Task<string[]>>(() => ListFilesAsync(gitClient, repoId, dir, version))).Value));
+
+        List<(string Directory, string Path)> wanted =
+        [
+            .. directories.Zip(listings).SelectMany(pair =>
+                RepoContextPlanner.ScopedFilesIn(pair.Second).Select(path => (pair.First, path)))
+        ];
+
+        string?[] contents = await Task.WhenAll(wanted.Select(w => TryReadAsync(gitClient, repoId, w.Path, version)));
+
+        List<RepoContextFile> files = RepoContextPlanner.Assemble(
+            [.. wanted.Select((w, i) => (IReadOnlyList<(string, string?)>)[(w.Path, contents[i])])],
+            _reviewSettings.MaxScopedContextChars,
+            _reviewSettings.MaxRepoContextFileChars);
+
+        foreach (RepoContextFile file in files)
+        {
+            file.AppliesTo = wanted.First(w => w.Path == file.Path).Directory + "/";
+        }
+
+        return files;
+    }
+
+    // Outlines of the files outside the PR that its changed files use, read
+    // from the target branch.
+    private async Task<List<ReferencedDefinition>> GetReferencedDefinitionsAsync(
+        GitHttpClient gitClient, string repoId, string targetBranch,
+        List<ChangedFile> files, List<SkippedFile> skipped)
+    {
+        GitVersionDescriptor version = new() { Version = targetBranch, VersionType = GitVersionType.Branch };
+
+        string[] tree = await _treeCache.GetOrAdd(
+            $"{repoId}@{targetBranch}",
+            _ => new Lazy<Task<string[]>>(() => ListTreeAsync(gitClient, repoId, version))).Value;
+        if (tree.Length == 0)
+        {
+            return [];
+        }
+
+        HashSet<string> inPr = new(files.Select(f => f.Path).Concat(skipped.Select(s => s.Path)), StringComparer.Ordinal);
+        List<DefinitionCandidate> candidates = DefinitionIndex.SelectCandidates(
+            files, tree, inPr, _reviewSettings.MaxReferencedDefinitions);
+
+        string?[] contents = await Task.WhenAll(candidates.Select(c => TryReadAsync(gitClient, repoId, c.Path, version)));
+
+        List<ReferencedDefinition> result = [];
+        for (int i = 0; i < candidates.Count; i++)
+        {
+            if (string.IsNullOrWhiteSpace(contents[i]) || DiffBuilder.LooksBinary(contents[i]!))
+            {
+                continue;
+            }
+
+            string outline = DefinitionIndex.Outline(candidates[i].Path, contents[i]!, _reviewSettings.MaxDefinitionOutlineChars);
+            if (outline.Length != 0)
+            {
+                result.Add(new ReferencedDefinition
+                {
+                    Path = candidates[i].Path,
+                    Outline = outline,
+                    ReferencedFrom = candidates[i].ReferencedFrom
+                });
+            }
+        }
+
+        return result;
+    }
+
+    // Every file path in the repository on one branch. Empty when it cannot
+    // be listed, in which case reviews go ahead without referenced definitions.
+    private async Task<string[]> ListTreeAsync(GitHttpClient gitClient, string repoId, GitVersionDescriptor version)
+    {
+        await _readGate.WaitAsync();
+        try
+        {
+            List<GitItem> items = await gitClient.GetItemsAsync(
+                repoId, scopePath: "/", recursionLevel: VersionControlRecursionType.Full, versionDescriptor: version);
+            return [.. items.Where(i => !i.IsFolder && !string.IsNullOrEmpty(i.Path)).Select(i => i.Path)];
+        }
+        catch (Exception ex)
+        {
+            DeferredConsole.WriteLine($"Warning: could not list the repository's files ({ex.Message}); reviewing without referenced definitions.");
+            return [];
+        }
+        finally
+        {
+            _readGate.Release();
+        }
+    }
+
+    private async Task<List<LinkedWorkItem>> GetWorkItemsAsync(GitHttpClient gitClient, string repoId, int prId)
+    {
+        try
+        {
+            List<ResourceRef> refs = await gitClient.GetPullRequestWorkItemRefsAsync(_settings.Project, repoId, prId);
+            List<int> ids =
+            [
+                .. refs.Select(r => int.TryParse(r.Id, NumberStyles.Integer, CultureInfo.InvariantCulture, out int id) ? id : 0)
+                    .Where(id => id > 0)
+                    .Distinct()
+                    .Take(_reviewSettings.MaxWorkItems)
+            ];
+
+            if (ids.Count == 0)
+            {
+                return [];
+            }
+
+            WorkItemTrackingHttpClient workItemClient = await _connection.GetClientAsync<WorkItemTrackingHttpClient>();
+            List<WorkItem> items = await workItemClient.GetWorkItemsAsync(
+                ids,
+                fields:
+                [
+                    "System.WorkItemType", "System.Title", "System.Description",
+                    "Microsoft.VSTS.Common.AcceptanceCriteria", "Microsoft.VSTS.TCM.ReproSteps"
+                ],
+                errorPolicy: WorkItemErrorPolicy.Omit);
+
+            return
+            [
+                .. items.Where(i => i?.Id is not null).Select(i => IntentContext.Describe(
+                    i.Id!.Value,
+                    Field(i, "System.WorkItemType"),
+                    Field(i, "System.Title"),
+                    // A bug keeps its story in the repro steps, not the description.
+                    Field(i, "System.Description") ?? Field(i, "Microsoft.VSTS.TCM.ReproSteps"),
+                    Field(i, "Microsoft.VSTS.Common.AcceptanceCriteria"),
+                    _reviewSettings.MaxWorkItemChars))
+            ];
+        }
+        catch (Exception ex)
+        {
+            if (Interlocked.Exchange(ref _workItemWarningShown, 1) == 0)
+            {
+                DeferredConsole.WriteLine(
+                    $"Warning: could not read linked work items ({ex.Message}). Reviews continue without them; "
+                    + "give the PAT Work Items (Read), or set Review:IncludeWorkItems to false.");
+            }
+
+            return [];
+        }
+    }
+
+    private static string? Field(WorkItem item, string name)
+        => item.Fields is not null && item.Fields.TryGetValue(name, out object? value) ? value?.ToString() : null;
+
+    private async Task<List<string>> GetCommitMessagesAsync(GitHttpClient gitClient, string repoId, int prId)
+    {
+        try
+        {
+            List<GitCommitRef> commits = await gitClient.GetPullRequestCommitsAsync(_settings.Project, repoId, prId);
+            return IntentContext.UsefulCommitMessages(
+                commits.Select(c => c.Comment), _reviewSettings.MaxCommitMessages, maxCharsEach: 300);
+        }
+        catch (Exception ex)
+        {
+            DeferredConsole.WriteLine($"Warning: Could not get commits for PR #{prId}: {ex.Message}");
+            return [];
+        }
     }
 
     // Paths of the files directly inside one folder. A folder that does not
@@ -273,7 +503,8 @@ public class AzureDevOpsService
                         Author = c.Author?.DisplayName ?? "Unknown",
                         Content = content,
                         FilePath = thread.ThreadContext?.FilePath,
-                        LineNumber = thread.ThreadContext?.RightFileStart?.Line
+                        LineNumber = thread.ThreadContext?.RightFileStart?.Line,
+                        Status = thread.Status.ToString()
                     });
                 }
             }

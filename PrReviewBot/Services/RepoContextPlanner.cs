@@ -90,6 +90,58 @@ internal static class RepoContextPlanner
         return result;
     }
 
+    // Every folder between the repository root and each changed file, root
+    // excluded (the root is covered by the regular repository context),
+    // nearest to the files first.
+    public static List<string> AncestorDirectories(IEnumerable<string> changedPaths)
+    {
+        List<string> result = [];
+        HashSet<string> seen = new(StringComparer.OrdinalIgnoreCase);
+
+        foreach (string path in changedPaths)
+        {
+            string dir = ParentOf(path.Replace('\\', '/'));
+            while (dir != "/")
+            {
+                if (seen.Add(dir))
+                {
+                    result.Add(dir);
+                }
+
+                dir = ParentOf(dir);
+            }
+        }
+
+        return [.. result.OrderByDescending(d => d.Count(c => c == '/')).ThenBy(d => d, StringComparer.OrdinalIgnoreCase)];
+    }
+
+    // From the listing of one folder, the convention files to read: the first
+    // agent-instructions file (they point at each other, as at the root), and
+    // the folder's .editorconfig.
+    public static List<string> ScopedFilesIn(IReadOnlyCollection<string> filesInFolder)
+    {
+        string[] agentNames = ["AGENTS.md", "CLAUDE.md", ".cursorrules"];
+        List<string> result = [];
+
+        string? agent = agentNames
+            .Select(n => filesInFolder.FirstOrDefault(f => FileName(f).Equals(n, StringComparison.OrdinalIgnoreCase)))
+            .FirstOrDefault(f => f is not null);
+        if (agent is not null)
+        {
+            result.Add(agent);
+        }
+
+        string? editorConfig = filesInFolder.FirstOrDefault(f => FileName(f).Equals(".editorconfig", StringComparison.OrdinalIgnoreCase));
+        if (editorConfig is not null)
+        {
+            result.Add(editorConfig);
+        }
+
+        return result;
+    }
+
+    private static string FileName(string path) => path[(path.LastIndexOf('/') + 1)..];
+
     private static string ParentOf(string path)
     {
         int slash = path.LastIndexOf('/');

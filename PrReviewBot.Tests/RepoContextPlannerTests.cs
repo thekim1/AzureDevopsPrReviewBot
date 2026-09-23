@@ -77,4 +77,20 @@ public class RepoContextPlannerTests
         Assert.True(result[0].IsTruncated);
         Assert.True(result[1].IsTruncated);
     }
+
+    [Fact]
+    public void AncestorFoldersAreNearestFirstAndExcludeTheRoot()
+        => Assert.Equal(
+            ["/src/web/components", "/src/api", "/src/web", "/src"],
+            RepoContextPlanner.AncestorDirectories(["/src/web/components/A.vue", "/src/api/B.cs", "/src/web/components/C.vue"]));
+
+    [Fact]
+    public void ScopedFilesAreTheFirstAgentFileAndTheEditorConfig()
+        => Assert.Equal(
+            ["/src/web/AGENTS.md", "/src/web/.editorconfig"],
+            RepoContextPlanner.ScopedFilesIn(["/src/web/package.json", "/src/web/CLAUDE.md", "/src/web/.editorconfig", "/src/web/AGENTS.md"]));
+
+    [Fact]
+    public void FolderWithoutConventionsContributesNothing()
+        => Assert.Empty(RepoContextPlanner.ScopedFilesIn(["/src/web/package.json"]));
 }

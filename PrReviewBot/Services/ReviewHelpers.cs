@@ -73,12 +73,40 @@ internal static class ReviewHelpers
         project has explicitly chosen against, and never flag a style rule that the project's
         .editorconfig or analyzers already enforce — that is the compiler's job, not yours.
 
+        A "FOLDER CONVENTIONS" section holds the same kind of files from sub-folders. Each applies
+        only to files under the folder it names, and there it takes precedence over the
+        repository-wide ones.
+
+        ## What the change is for
+
+        The input may include "LINKED WORK ITEMS" and "COMMITS" describing what the PR is meant to
+        do. Use them to understand intent: a behaviour change that a work item asks for is not a
+        defect, and a change that plainly contradicts its work item is worth pointing out. Do NOT
+        report that a requirement or acceptance criterion is missing or unimplemented — it may be
+        implemented in files you cannot see.
+
+        ## The rest of the PR
+
+        A large PR is reviewed in parts, and you are given one part. A "CHANGE SUMMARY" section
+        lists every file in the PR with the public declarations it adds (+) or removes (-). Use it
+        to check that the code you are shown agrees with signatures changed elsewhere — a call
+        that no longer matches a changed signature is a real finding. Do not comment on files
+        that are only in the summary; their code is reviewed separately.
+
+        ## Referenced definitions
+
+        A "REFERENCED DEFINITIONS" section may give outlines of files outside the PR that the
+        shown code uses: declarations and signatures only, with every method body left out. Use
+        them to check calls, types, nullability and parameters. Never conclude anything about
+        how a member is implemented — its body is not shown — and do not comment on these files.
+
         ## Existing comments
 
         The input may include an "EXISTING PR COMMENTS" section with feedback already left by
         others. Read these first. Do NOT repeat or contradict what has already been said. You
         may build on them, confirm a prior concern with new evidence, or note that a raised
-        question is addressed by the changes.
+        question is addressed by the changes. A comment marked (thread Fixed), (thread WontFix),
+        (thread ByDesign) or (thread Closed) has been decided — never raise that concern again.
 
         ## Scope
 
@@ -153,8 +181,17 @@ internal static class ReviewHelpers
     internal const int MaxSkippedFilesListedPerReason = 10;
 
     public static string BuildReviewPrompt(
-        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true)
-        => BuildReviewPromptParts(pr, files, scopeCommentsToBatch).Full;
+        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true,
+        int maxChangeSummaryChars = 0, int maxReferencedDefinitionChars = 0)
+        => BuildReviewPromptParts(pr, files, scopeCommentsToBatch, maxChangeSummaryChars, maxReferencedDefinitionChars).Full;
+
+    // The prompt exactly as a provider builds it from the review settings.
+    public static ReviewPrompt BuildReviewPromptParts(
+        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, Config.ReviewSettings settings)
+        => BuildReviewPromptParts(
+            pr, files, settings.ScopeExistingCommentsToBatch,
+            settings.IncludeChangeSummary ? settings.MaxChangeSummaryChars : 0,
+            settings.IncludeReferencedDefinitions ? settings.MaxReferencedDefinitionChars : 0);
 
     // Builds the prompt in two parts: everything that is the same for every
     // batch of this PR, then everything specific to this batch.
@@ -165,7 +202,8 @@ internal static class ReviewHelpers
     // after the first read that material from the cache. Providers that need an
     // explicit cache breakpoint (Anthropic) place it between the two parts.
     public static ReviewPrompt BuildReviewPromptParts(
-        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true)
+        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true,
+        int maxChangeSummaryChars = 0, int maxReferencedDefinitionChars = 0)
     {
         StringBuilder shared = new();
 
@@ -191,6 +229,25 @@ internal static class ReviewHelpers
             shared.AppendLine();
         }
 
+        if (pr.ScopedContext.Count != 0)
+        {
+            shared.AppendLine("=== FOLDER CONVENTIONS (each applies only to files under its folder, and overrides the repository-wide ones there) ===");
+            foreach (RepoContextFile file in pr.ScopedContext)
+            {
+                shared.AppendLine(CultureInfo.InvariantCulture, $"--- {file.Path} (applies to {file.AppliesTo}) ---");
+                shared.AppendLine(file.Content);
+                if (file.IsTruncated)
+                {
+                    shared.AppendLine("[... truncated ...]");
+                }
+
+                shared.AppendLine();
+            }
+
+            shared.AppendLine("=== END FOLDER CONVENTIONS ===");
+            shared.AppendLine();
+        }
+
         shared.AppendLine("Review this Pull Request:");
         shared.AppendLine(CultureInfo.InvariantCulture, $"Repository: {pr.RepositoryName}");
         shared.AppendLine(CultureInfo.InvariantCulture, $"Title: {pr.Title}");
@@ -199,6 +256,35 @@ internal static class ReviewHelpers
         if (!string.IsNullOrWhiteSpace(pr.Description))
         {
             shared.AppendLine(CultureInfo.InvariantCulture, $"Description: {pr.Description}");
+        }
+
+        if (pr.WorkItems.Count != 0)
+        {
+            shared.AppendLine();
+            shared.AppendLine("=== LINKED WORK ITEMS (what this change is for — never report a requirement as unimplemented; it may be done in files you cannot see) ===");
+            foreach (LinkedWorkItem item in pr.WorkItems)
+            {
+                shared.AppendLine(CultureInfo.InvariantCulture, $"#{item.Id} [{item.Type}] {item.Title}");
+                if (item.Description.Length != 0)
+                {
+                    shared.AppendLine(CultureInfo.InvariantCulture, $"Description: {item.Description}");
+                }
+
+                if (item.AcceptanceCriteria.Length != 0)
+                {
+                    shared.AppendLine(CultureInfo.InvariantCulture, $"Acceptance criteria: {item.AcceptanceCriteria}");
+                }
+            }
+        }
+
+        if (pr.CommitMessages.Count != 0)
+        {
+            shared.AppendLine();
+            shared.AppendLine("=== COMMITS (messages on this PR's branch) ===");
+            foreach (string message in pr.CommitMessages)
+            {
+                shared.AppendLine(CultureInfo.InvariantCulture, $"- {message.Replace("\n", "\n  ", StringComparison.Ordinal)}");
+            }
         }
 
         if (pr.SkippedFiles.Count != 0)
@@ -225,6 +311,15 @@ internal static class ReviewHelpers
             }
         }
 
+        // Only when this batch is not the whole PR: otherwise every file in the
+        // summary is right there in full.
+        if (maxChangeSummaryChars > 0 && pr.ChangedFiles.Count > files.Count)
+        {
+            shared.AppendLine();
+            shared.AppendLine("=== CHANGE SUMMARY (every file in this PR and the public declarations it adds/removes — most are reviewed in other parts; do not comment on them) ===");
+            shared.Append(ChangeSummary.Build(pr.ChangedFiles, maxChangeSummaryChars));
+        }
+
         StringBuilder batch = new();
 
         // Only comments about files in this batch (plus PR-level ones). A
@@ -245,7 +340,36 @@ internal static class ReviewHelpers
                 string location = c.FilePath is not null
                     ? $" [{c.FilePath}{(c.LineNumber.HasValue ? $":{c.LineNumber}" : "")}]"
                     : " [PR-level]";
-                target.AppendLine(CultureInfo.InvariantCulture, $"{c.Author}{location}: {c.Content}");
+                string status = c.Status is null or "Active" or "Unknown" or "Pending" ? "" : $" (thread {c.Status})";
+                target.AppendLine(CultureInfo.InvariantCulture, $"{c.Author}{location}{status}: {c.Content}");
+            }
+        }
+
+        // Outlines of what this batch's files use, most referenced first,
+        // within the batch's budget.
+        if (maxReferencedDefinitionChars > 0 && pr.ReferencedDefinitions.Count != 0)
+        {
+            HashSet<string> batchPaths = new(files.Select(f => f.Path), StringComparer.Ordinal);
+            List<ReferencedDefinition> relevant = [.. pr.ReferencedDefinitions.Where(d => d.ReferencedFrom.Exists(batchPaths.Contains))];
+
+            if (relevant.Count != 0)
+            {
+                batch.AppendLine();
+                batch.AppendLine("=== REFERENCED DEFINITIONS (outlines of files outside this PR that the code below uses — signatures only, bodies omitted; do not comment on them) ===");
+                int used = 0;
+                foreach (ReferencedDefinition definition in relevant)
+                {
+                    if (used + definition.Outline.Length > maxReferencedDefinitionChars)
+                    {
+                        continue;
+                    }
+
+                    batch.AppendLine(CultureInfo.InvariantCulture, $"--- {definition.Path} ---");
+                    batch.AppendLine(definition.Outline);
+                    used += definition.Outline.Length;
+                }
+
+                batch.AppendLine("=== END REFERENCED DEFINITIONS ===");
             }
         }
 

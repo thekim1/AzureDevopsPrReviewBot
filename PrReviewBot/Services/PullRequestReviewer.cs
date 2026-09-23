@@ -78,7 +78,7 @@ public sealed class PullRequestReviewer
                 // show it as still queued, which looks the same as a request
                 // stuck waiting on the provider.
                 int promptChars = ReviewHelpers.SystemPrompt.Length
-                    + ReviewHelpers.BuildReviewPrompt(pr, batch, _settings.ScopeExistingCommentsToBatch).Length;
+                    + ReviewHelpers.BuildReviewPromptParts(pr, batch, _settings).Full.Length;
                 batchProgress?.Report(new ReviewProgress(index, 0, 0, null, IsAnswer: false, promptChars));
 
                 using CancellationTokenSource deadline = new(RequestTimeout);

@@ -35,7 +35,7 @@ one. See [Review accuracy](#review-accuracy).
 |---|---|
 | [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0) | Only to build from source — the [prebuilt downloads](#option-a-download-a-release-no-net-needed) bundle their own runtime |
 | Azure DevOps account | With access to the target project |
-| Azure DevOps PAT | Personal Access Token with `Code (Read)` and `Code (Write)` scopes |
+| Azure DevOps PAT | Personal Access Token with `Code (Read)` and `Code (Write)` scopes, plus `Work Items (Read)` for linked work items |
 | A model provider | **One** of: an [Anthropic API key](https://console.anthropic.com/), an [Ollama](https://ollama.com) instance (local needs no key), or a [Bifrost](https://github.com/maximhq/bifrost) gateway |
 
 ---
@@ -146,16 +146,18 @@ The app loads configuration from the following sources in order (later sources o
 |---|---|
 | `AzureDevOps:OrganizationUrl` | Your Azure DevOps org URL, e.g. `https://dev.azure.com/myorg` |
 | `AzureDevOps:Project` | The Azure DevOps project name |
-| `AzureDevOps:PersonalAccessToken` | PAT with `Code (Read)` + `Code (Write)` scopes |
+| `AzureDevOps:PersonalAccessToken` | PAT with `Code (Read)` + `Code (Write)` scopes, and `Work Items (Read)` for linked work items |
 | `AzureDevOps:ReviewerEmail` | Your email — used to identify PRs assigned to you |
 | `Claude:ApiKey` | Your Anthropic API key |
 | `Claude:Model` | Claude model to use (default: `claude-sonnet-4-6`) |
 | `Ollama:ApiKey` | Your Ollama API key (for ollama.com cloud; leave empty for local Ollama) |
 | `Ollama:BaseUrl` | Ollama API base URL (default: `https://ollama.com/api`; use `http://localhost:11434/api` for local) |
 | `Ollama:Model` | Ollama model to use (default: `glm-5.2:cloud`) |
+| `Ollama:Think` | Sent as Ollama's `think` field: one of the model's own thinking levels, or `true`/`false`. Empty = the model's default, which for `glm-5.3-flash` is its **highest** level, `max`. Levels are per model — list them with `curl https://ollama.com/api/show -d '{"model":"glm-5.3-flash"}'` (glm-5.3-flash: `low`, `high`, `max`). Use a listed name exactly: an unlisted one such as `minimal` falls back to the default. Leave empty for models without thinking |
 | `Bifrost:ApiKey` | Your Bifrost API key (e.g. a Bifrost virtual key; leave empty for an unauthenticated local gateway) |
 | `Bifrost:BaseUrl` | Bifrost OpenAI-compatible base URL (default: `http://localhost:8080/v1`) |
 | `Bifrost:Model` | Model in `provider/model` form (default: `anthropic/claude-sonnet-4-5`) |
+| `Bifrost:ReasoningEffort` | Sent as `reasoning_effort` when set. For an Ollama model, use one of its own levels (see `Ollama:Think`). The Thinking column in the live display shows whether it took effect |
 | `Bifrost:ResponseFormat` | Sent as `response_format: {"type": ...}`. Defaults to `json_object` — the OpenAI-style analogue of the native Ollama path's `format: "json"`. **Hybrid reasoning models (GLM, Qwen, DeepSeek) need this**: without a JSON constraint they emit a thinking block that the gateway reports as `reasoning_content`, leaving `content` empty and the review looking like it found nothing. Set to empty to disable if your gateway rejects the parameter |
 | `Bifrost:ExtraParameters` | Extra top-level fields merged into the request body verbatim. Only useful for parameters the OpenAI schema already defines — **Bifrost drops fields it does not recognise**, so Ollama-native switches like `think` never reach the model (verified against a live gateway). Empty this first if a request starts failing |
 | `Bifrost:Temperature` | Optional sampling temperature. Unset by default — Anthropic models reject any value but `1.0`. Set to `0` when routing to OpenAI, Ollama, or another provider that honours it |
@@ -183,6 +185,15 @@ tuned so the prompt is *more* useful without being bigger — see [Review accura
 | `Review:MaxRequestMinutes` | `15` | Hard limit on one request, start to finish — catches a model that trickles output slowly enough to never trip the idle timeout |
 | `Review:WarmPrefixCache` | `true` | Run the first batch alone so the shared prefix lands in the provider's prompt cache before the rest go out. Costs ~one round trip, makes every later batch far cheaper. Set `false` to favour speed over cost |
 | `Review:ScopeExistingCommentsToBatch` | `true` | Send only the existing PR comments that concern the batch's own files (plus PR-level ones) |
+| `Review:IncludeScopedContext` | `true` | Also read `AGENTS.md` / `CLAUDE.md` and `.editorconfig` from the folders the changed files live in — a monorepo sub-project's own conventions |
+| `Review:MaxScopedContextChars` | `8000` | Budget for those folder-level files, nearest folder first |
+| `Review:IncludeWorkItems` | `true` | Put linked work items (title, description, acceptance criteria) in the prompt. Needs `Work Items (Read)` on the PAT; without it the review carries on and says so once |
+| `Review:MaxWorkItems` / `Review:MaxWorkItemChars` | `5` / `1500` | How many work items, and characters per item |
+| `Review:IncludeCommitMessages` / `Review:MaxCommitMessages` | `true` / `20` | Put the PR's commit messages (merges left out) in the prompt |
+| `Review:IncludeChangeSummary` / `Review:MaxChangeSummaryChars` | `true` / `4000` | When a PR spans several batches, give each one a list of every changed file and the public declarations it adds or removes |
+| `Review:IncludeReferencedDefinitions` | `true` | Send outlines (declarations, no bodies) of the types and modules the changed code uses from files outside the PR — found by `Foo`-in-`Foo.cs` for C# and by import path for TypeScript/Vue |
+| `Review:MaxReferencedDefinitions` | `12` | Definition files fetched per PR, most referenced first |
+| `Review:MaxReferencedDefinitionChars` / `Review:MaxDefinitionOutlineChars` | `6000` / `1500` | Outline budget per batch, and per outline |
 | `Review:MaxDiffLinesPerFile` | `400` | Cap on emitted diff lines per file, applied after hunking |
 | `Review:MaxOutputTokens` | `16384` | Budget for the model's *answer*. Reasoning models bill their thinking against this too, so 4096 can be exhausted before a single character of JSON is emitted — raise it if reviews come back empty or cut off mid-array |
 | `Review:IncludeRepoContext` | `true` | Read the repo's agent/architecture/style files from the target branch |
@@ -286,8 +297,14 @@ shown. Four things keep that in check:
    `copilot-instructions.md`, architecture notes, README and `.editorconfig` are read from the PR's
    **target branch** and marked authoritative, so a deliberate project convention is not reported
    as a defect.
-3. **A partial-view rule in the prompt.** The model is told explicitly never to report something as
-   missing, unregistered, unused or never called unless the shown lines prove it.
+3. **A partial-view rule in the prompt, and less left unseen.** The model is told explicitly never
+   to report something as missing, unregistered, unused or never called unless the shown lines
+   prove it. To keep that rule from also silencing real findings, each part is given what it would
+   otherwise have to guess at: outlines of the types and modules the changed code uses, a summary
+   of the signatures changed in the PR's other parts, the linked work items and commit messages
+   (what the change is *for*), and the status of existing comment threads, so a concern already
+   resolved as "won't fix" is not raised again. The model is told never to report a requirement as
+   unimplemented, since it may be done in a file it cannot see.
 4. **Local grounding checks** (`ReviewValidator`). Every finding must quote the source line it
    refers to. After the response comes back, each quote is looked up in the diff that was actually
    sent. Findings on files that are not in the PR, or quoting code that was never shown, are
@@ -464,6 +481,7 @@ PrReviewBot/
 3. Set an expiration date and select the following scopes:
    - **Code** → `Read`
    - **Code** → `Write` *(only needed if you want to post comments)*
+   - **Work Items** → `Read` *(for linked work items; optional)*
 4. Copy the generated token into your configuration
 
 ---

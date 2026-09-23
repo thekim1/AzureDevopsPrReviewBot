@@ -30,6 +30,18 @@ public class OllamaSettings
     public string ApiKey { get; set; } = "";
     public string BaseUrl { get; set; } = "https://ollama.com/api";
     public string Model { get; set; } = "glm-5.3-flash:cloud";
+
+    // How hard a reasoning model thinks, sent as Ollama's `think` field: one
+    // of the model's own levels, or "true"/"false". Empty leaves the model's
+    // default — which for glm-5.3-flash is its HIGHEST level, "max".
+    //
+    // The levels are per model; ask Ollama for them with
+    //   curl https://ollama.com/api/show -d '{"model":"glm-5.3-flash"}'
+    // (glm-5.3-flash: "low", "high", "max"). Use a listed name exactly: a
+    // name the model does not list, such as "minimal", falls back to the
+    // default instead of the nearest level. Leave empty for a model without
+    // thinking, which may reject the field.
+    public string Think { get; set; } = "";
 }
 
 // Bifrost LLM gateway (https://github.com/maximhq/bifrost). Uses its
@@ -58,6 +70,16 @@ public class BifrostSettings
     // with {"comments": [...]}; the parser accepts either shape. Set to empty
     // to disable if your gateway or provider rejects the parameter.
     public string ResponseFormat { get; set; } = "json_object";
+
+    // Sent as `reasoning_effort` when set — the OpenAI-schema way to ask a
+    // reasoning model for less (or more) thinking, which Bifrost understands
+    // and translates per provider. For an Ollama model the value must be one
+    // of the model's own levels (see OllamaSettings.Think; glm-5.3-flash:
+    // "low", "high", "max"). Empty leaves the model's default.
+    //
+    // To confirm it reaches the model, watch the Thinking column in the live
+    // display: at "low" it should be a fraction of what it was.
+    public string ReasoningEffort { get; set; } = "";
 
     // Extra top-level fields merged into the request body verbatim.
     //
@@ -156,6 +178,52 @@ public class ReviewSettings
     // Per-file cap inside the bundle, so one huge README or .editorconfig
     // cannot crowd out the agent instructions that matter most.
     public int MaxRepoContextFileChars { get; set; } = 8000;
+
+    // Also read AGENTS.md / CLAUDE.md and .editorconfig from the folders the
+    // changed files live in, not just the repository root. In a monorepo that
+    // is where each sub-project keeps its own conventions.
+    public bool IncludeScopedContext { get; set; } = true;
+
+    // Budget for those folder-level files together, nearest folder first.
+    public int MaxScopedContextChars { get; set; } = 8000;
+
+    // Put the PR's linked work items (title, description, acceptance
+    // criteria) in the prompt, so the change is reviewed against what it is
+    // for. Needs the PAT to have Work Items (Read); without it the review
+    // carries on without them.
+    public bool IncludeWorkItems { get; set; } = true;
+
+    // Characters per work item, description and acceptance criteria together.
+    public int MaxWorkItemChars { get; set; } = 1500;
+
+    public int MaxWorkItems { get; set; } = 5;
+
+    // Put the PR's commit messages (merges left out) in the prompt.
+    public bool IncludeCommitMessages { get; set; } = true;
+
+    // When a PR spans several batches, send every batch a one-line-per-change
+    // list of the public declarations each changed file adds or removes, so a
+    // batch can check the code it sees against signatures changed elsewhere.
+    public bool IncludeChangeSummary { get; set; } = true;
+
+    public int MaxChangeSummaryChars { get; set; } = 4000;
+
+    // Send outlines — declarations, no bodies — of the types and modules the
+    // changed code uses, from files outside the PR. Answers most "might be
+    // null / might not exist" questions the model would otherwise guess at.
+    // Found by the Foo-in-Foo.cs convention for C# and by import path for
+    // TypeScript and Vue.
+    public bool IncludeReferencedDefinitions { get; set; } = true;
+
+    // Definition files fetched per PR, the most referenced first.
+    public int MaxReferencedDefinitions { get; set; } = 12;
+
+    // Characters of outlines per batch, and per outline.
+    public int MaxReferencedDefinitionChars { get; set; } = 6000;
+
+    public int MaxDefinitionOutlineChars { get; set; } = 1500;
+
+    public int MaxCommitMessages { get; set; } = 20;
 
     // Candidate paths grouped by what they tell the reviewer. Only the FIRST
     // file found in each group is used.

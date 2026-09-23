@@ -140,4 +140,74 @@ public class ReviewPromptTests
         Assert.Contains("... and 290 more — binary or media file", prefix);
         Assert.Contains("/package-lock.json — lockfile", prefix);
     }
+
+    [Fact]
+    public void IntentAndHistoryAreInTheSharedPart()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"));
+        pr.WorkItems = [new LinkedWorkItem { Id = 19235, Type = "User Story", Title = "Upload PDFs", AcceptanceCriteria = "Max 10 MB" }];
+        pr.CommitMessages = ["Allow PDF\nand tests"];
+        pr.ScopedContext = [new RepoContextFile { Path = "/web/AGENTS.md", Content = "Use Pinia.", AppliesTo = "/web/" }];
+
+        string prefix = ReviewHelpers.BuildReviewPromptParts(pr, pr.ChangedFiles).SharedPrefix;
+
+        Assert.Contains("#19235 [User Story] Upload PDFs", prefix);
+        Assert.Contains("Acceptance criteria: Max 10 MB", prefix);
+        Assert.Contains("- Allow PDF\n  and tests", prefix.Replace("\r", "", StringComparison.Ordinal));
+        Assert.Contains("--- /web/AGENTS.md (applies to /web/) ---", prefix);
+    }
+
+    [Fact]
+    public void DecidedThreadsAreMarked()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"));
+        pr.ExistingComments =
+        [
+            new PrComment { Author = "R", Content = "Use a record", FilePath = "/a.cs", Status = "WontFix" },
+            new PrComment { Author = "R", Content = "Still open", FilePath = "/a.cs", Status = "Active" }
+        ];
+
+        string suffix = ReviewHelpers.BuildReviewPromptParts(pr, pr.ChangedFiles).BatchSuffix;
+
+        Assert.Contains("[/a.cs] (thread WontFix): Use a record", suffix);
+        Assert.Contains("[/a.cs]: Still open", suffix);
+    }
+
+    [Fact]
+    public void ChangeSummaryOnlyWhenTheBatchIsNotTheWholePr()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"), File("/b.cs"));
+
+        Assert.Contains("CHANGE SUMMARY", ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[0]], true, 4000).SharedPrefix);
+        Assert.DoesNotContain("CHANGE SUMMARY", ReviewHelpers.BuildReviewPromptParts(pr, pr.ChangedFiles, true, 4000).SharedPrefix);
+        Assert.DoesNotContain("CHANGE SUMMARY", ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[0]], true, 0).SharedPrefix);
+    }
+
+    [Fact]
+    public void ReferencedDefinitionsGoOnlyToTheBatchesThatUseThem()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"), File("/b.cs"));
+        pr.ReferencedDefinitions =
+        [
+            new ReferencedDefinition { Path = "/IUserService.cs", Outline = "public interface IUserService", ReferencedFrom = ["/a.cs"] },
+            new ReferencedDefinition { Path = "/Big.cs", Outline = new string('x', 5000), ReferencedFrom = ["/a.cs"] }
+        ];
+
+        string forA = ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[0]], true, 0, 1000).BatchSuffix;
+        string forB = ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[1]], true, 0, 1000).BatchSuffix;
+
+        Assert.Contains("--- /IUserService.cs ---", forA);
+        Assert.DoesNotContain("/Big.cs", forA);
+        Assert.DoesNotContain("REFERENCED DEFINITIONS", forB);
+    }
+
+    [Fact]
+    public void SettingsOverloadMatchesWhatProvidersSend()
+    {
+        PullRequestInfo pr = Pr(File("/a.cs"), File("/b.cs"));
+        PrReviewBot.Config.ReviewSettings settings = new() { IncludeChangeSummary = false };
+
+        Assert.DoesNotContain("CHANGE SUMMARY", ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[0]], settings).SharedPrefix);
+        Assert.Contains("CHANGE SUMMARY", ReviewHelpers.BuildReviewPromptParts(pr, [pr.ChangedFiles[0]], new PrReviewBot.Config.ReviewSettings()).SharedPrefix);
+    }
 }

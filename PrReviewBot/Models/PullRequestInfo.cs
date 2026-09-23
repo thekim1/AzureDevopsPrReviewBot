@@ -23,6 +23,16 @@ public class PullRequestInfo
     // read from the target branch. Tells the reviewer what "correct" looks
     // like in *this* codebase instead of guessing from generic best practice.
     public List<RepoContextFile> RepoContext { get; set; } = [];
+    // Convention files (AGENTS.md, .editorconfig, ...) from the folders the
+    // changed files live in, below the repository root. In a monorepo these
+    // are where each sub-project's own rules are.
+    public List<RepoContextFile> ScopedContext { get; set; } = [];
+    // Work items linked to the PR: what the change is meant to achieve.
+    public List<LinkedWorkItem> WorkItems { get; set; } = [];
+    // Commit messages on the PR's branch, merges left out.
+    public List<string> CommitMessages { get; set; } = [];
+    // Outlines of files outside the PR that the changed code uses.
+    public List<ReferencedDefinition> ReferencedDefinitions { get; set; } = [];
     // Files that were changed by the PR but deliberately not sent for review
     // (binary, too large, diff failed). Listed in the prompt so the model
     // knows its view of the change is incomplete and does not reason about
@@ -56,10 +66,30 @@ public class ChangedFile
     public int ChangeTrackingId { get; set; }
 }
 
+// An outline (declarations, no bodies) of a file outside the PR that the
+// changed code refers to, and which changed files refer to it.
+public class ReferencedDefinition
+{
+    public string Path { get; set; } = "";
+    public string Outline { get; set; } = "";
+    public List<string> ReferencedFrom { get; set; } = [];
+}
+
+public class LinkedWorkItem
+{
+    public int Id { get; set; }
+    public string Type { get; set; } = "";
+    public string Title { get; set; } = "";
+    public string Description { get; set; } = "";
+    public string AcceptanceCriteria { get; set; } = "";
+}
+
 // A convention/architecture document read from the repository's target branch.
 public class RepoContextFile
 {
     public string Path { get; set; } = "";
+    // For a file below the root: the folder whose files it governs.
+    public string? AppliesTo { get; set; }
     public string Content { get; set; } = "";
     public bool IsTruncated { get; set; }
 }
@@ -79,4 +109,8 @@ public class PrComment
     public string Content { get; set; } = "";
     public string? FilePath { get; set; }
     public int? LineNumber { get; set; }
+    // The thread's status in Azure DevOps: Active, Fixed, WontFix, Closed,
+    // ByDesign, Pending. A concern someone already decided not to act on
+    // should not come back from the reviewer.
+    public string? Status { get; set; }
 }

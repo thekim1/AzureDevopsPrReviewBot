@@ -16,7 +16,7 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
     private readonly OllamaSettings _settings;
     private readonly HttpClient _httpClient;
     private readonly int _maxOutputTokens;
-    private readonly bool _scopeCommentsToBatch;
+    private readonly ReviewSettings _reviewSettings;
     private readonly bool _stream;
     private readonly TimeSpan _streamIdleTimeout;
 
@@ -36,7 +36,7 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
         _settings = settings;
         ReviewSettings review = reviewSettings ?? new ReviewSettings();
         _maxOutputTokens = review.MaxOutputTokens;
-        _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
+        _reviewSettings = review;
         _stream = review.ShowThinking;
         _streamIdleTimeout = TimeSpan.FromSeconds(Math.Max(1, review.StreamIdleTimeoutSeconds));
 
@@ -61,20 +61,9 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
         IProgress<ReviewProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        string prompt = ReviewHelpers.BuildReviewPrompt(pr, files, _scopeCommentsToBatch);
+        string prompt = ReviewHelpers.BuildReviewPromptParts(pr, files, _reviewSettings).Full;
 
-        object requestBody = new
-        {
-            model = _settings.Model,
-            system = ReviewHelpers.SystemPrompt,
-            prompt,
-            stream = _stream,
-            // Constrains generation to valid JSON, which also stops a hybrid
-            // reasoning model emitting a thinking block instead of an answer.
-            format = "json",
-            // Analytical task — randomness here produces invented findings.
-            options = new { temperature = 0, num_predict = _maxOutputTokens }
-        };
+        Dictionary<string, object> requestBody = BuildRequestBody(_settings, prompt, _stream, _maxOutputTokens);
 
         StringContent content = new(
             JsonSerializer.Serialize(requestBody),
@@ -106,6 +95,32 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
         }
 
         return ReviewHelpers.ParseReviewResponse(text);
+    }
+
+    internal static Dictionary<string, object> BuildRequestBody(
+        OllamaSettings settings, string prompt, bool stream, int maxOutputTokens)
+    {
+        Dictionary<string, object> body = new()
+        {
+            ["model"] = settings.Model,
+            ["system"] = ReviewHelpers.SystemPrompt,
+            ["prompt"] = prompt,
+            ["stream"] = stream,
+            // Constrains generation to valid JSON, which also stops a hybrid
+            // reasoning model emitting a thinking block instead of an answer.
+            ["format"] = "json",
+            // Analytical task — randomness here produces invented findings.
+            ["options"] = new { temperature = 0, num_predict = maxOutputTokens }
+        };
+
+        // "true"/"false" go as booleans, anything else as a level name.
+        string think = settings.Think.Trim();
+        if (think.Length != 0)
+        {
+            body["think"] = bool.TryParse(think, out bool enabled) ? enabled : think;
+        }
+
+        return body;
     }
 
     // Ollama streams newline-delimited JSON rather than server-sent events:

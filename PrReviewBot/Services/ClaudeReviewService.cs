@@ -11,7 +11,7 @@ public class ClaudeReviewService : IReviewService
     private readonly AnthropicClient _client;
     private readonly ClaudeSettings _settings;
     private readonly int _maxOutputTokens;
-    private readonly bool _scopeCommentsToBatch;
+    private readonly ReviewSettings _reviewSettings;
     private readonly bool _stream;
 
     public ClaudeReviewService(ClaudeSettings settings, ReviewSettings? reviewSettings = null)
@@ -19,7 +19,7 @@ public class ClaudeReviewService : IReviewService
         _settings = settings;
         ReviewSettings review = reviewSettings ?? new ReviewSettings();
         _maxOutputTokens = review.MaxOutputTokens;
-        _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
+        _reviewSettings = review;
         _stream = review.ShowThinking;
         // Official SDK: ApiKey is a property on the client initializer
         _client = new AnthropicClient { ApiKey = settings.ApiKey };
@@ -31,7 +31,7 @@ public class ClaudeReviewService : IReviewService
         IProgress<ReviewProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        ReviewPrompt prompt = ReviewHelpers.BuildReviewPromptParts(pr, files, _scopeCommentsToBatch);
+        ReviewPrompt prompt = ReviewHelpers.BuildReviewPromptParts(pr, files, _reviewSettings);
         MessageCreateParams parameters = BuildParameters(_settings.Model, _maxOutputTokens, prompt);
 
         if (_stream)

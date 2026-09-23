@@ -10,13 +10,16 @@ internal sealed class FakeStreamingHandler(string body, bool keepOpen, TimeSpan?
 {
     public int Requests { get; private set; }
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    public string? LastRequestBody { get; private set; }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         Requests++;
-        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        LastRequestBody = request.Content is null ? null : await request.Content.ReadAsStringAsync(cancellationToken);
+        return new HttpResponseMessage(HttpStatusCode.OK)
         {
             Content = new StreamContent(new ScriptedStream(Encoding.UTF8.GetBytes(body), keepOpen, heartbeat))
-        });
+        };
     }
 }
 

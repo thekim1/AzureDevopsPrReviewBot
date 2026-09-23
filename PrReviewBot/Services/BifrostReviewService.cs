@@ -17,7 +17,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
     private readonly BifrostSettings _settings;
     private readonly HttpClient _httpClient;
     private readonly int _maxOutputTokens;
-    private readonly bool _scopeCommentsToBatch;
+    private readonly ReviewSettings _reviewSettings;
     private readonly bool _stream;
     private readonly TimeSpan _streamIdleTimeout;
 
@@ -42,7 +42,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
         _settings = settings;
         ReviewSettings review = reviewSettings ?? new ReviewSettings();
         _maxOutputTokens = review.MaxOutputTokens;
-        _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
+        _reviewSettings = review;
         _stream = review.ShowThinking;
         _streamIdleTimeout = TimeSpan.FromSeconds(Math.Max(1, review.StreamIdleTimeoutSeconds));
 
@@ -67,7 +67,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
         IProgress<ReviewProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        string prompt = ReviewHelpers.BuildReviewPrompt(pr, files, _scopeCommentsToBatch);
+        string prompt = ReviewHelpers.BuildReviewPromptParts(pr, files, _reviewSettings).Full;
 
         Dictionary<string, object> requestBody = new()
         {
@@ -94,6 +94,11 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
         if (_settings.Temperature.HasValue)
         {
             requestBody["temperature"] = _settings.Temperature.Value;
+        }
+
+        if (!string.IsNullOrWhiteSpace(_settings.ReasoningEffort))
+        {
+            requestBody["reasoning_effort"] = _settings.ReasoningEffort.Trim();
         }
 
         // Constrains the model to JSON, the way the native Ollama path does
