@@ -31,26 +31,8 @@ public class ClaudeReviewService : IReviewService
         IProgress<ReviewProgress>? progress = null,
         CancellationToken cancellationToken = default)
     {
-        string prompt = ReviewHelpers.BuildReviewPrompt(pr, files, _scopeCommentsToBatch);
-
-        MessageCreateParams parameters = new()
-        {
-            Model = _settings.Model,
-            MaxTokens = _maxOutputTokens,
-            // Temperature is deliberately not set. It is deprecated on the
-            // Anthropic API — models released after Claude Opus 4.6 reject any
-            // value other than 1.0 with a 400 — and these models are already
-            // stable enough on analytical work without it.
-            System = ReviewHelpers.SystemPrompt,
-            Messages =
-            [
-                new()
-                {
-                    Role = Role.User,
-                    Content = prompt
-                }
-            ]
-        };
+        ReviewPrompt prompt = ReviewHelpers.BuildReviewPromptParts(pr, files, _scopeCommentsToBatch);
+        MessageCreateParams parameters = BuildParameters(_settings.Model, _maxOutputTokens, prompt);
 
         if (_stream)
         {
@@ -72,6 +54,54 @@ public class ClaudeReviewService : IReviewService
         }
 
         return ReviewHelpers.ParseReviewResponse(content);
+    }
+
+    // Anthropic caches a prompt only up to an explicit breakpoint, so without
+    // these every batch paid full price for the system prompt and repository
+    // context, and running the first batch alone to warm the cache
+    // (Review:WarmPrefixCache) only added a round trip.
+    //
+    // Two breakpoints:
+    //  * after the system prompt, which is the same for every PR, so a run over
+    //    several repositories still shares it;
+    //  * after the PR-wide part of the prompt (repository context, PR metadata,
+    //    skipped files), which every batch of this PR repeats word for word.
+    // A prefix shorter than the model's minimum cacheable length is simply
+    // not cached; the request is otherwise unaffected.
+    internal static MessageCreateParams BuildParameters(string model, int maxOutputTokens, ReviewPrompt prompt)
+    {
+        List<ContentBlockParam> content =
+        [
+            new TextBlockParam { Text = prompt.SharedPrefix, CacheControl = new CacheControlEphemeral() }
+        ];
+
+        // The API rejects an empty text block.
+        if (!string.IsNullOrWhiteSpace(prompt.BatchSuffix))
+        {
+            content.Add(new TextBlockParam { Text = prompt.BatchSuffix });
+        }
+
+        return new MessageCreateParams
+        {
+            Model = model,
+            MaxTokens = maxOutputTokens,
+            // Temperature is deliberately not set. It is deprecated on the
+            // Anthropic API — models released after Claude Opus 4.6 reject any
+            // value other than 1.0 with a 400 — and these models are already
+            // stable enough on analytical work without it.
+            System = new List<TextBlockParam>
+            {
+                new() { Text = ReviewHelpers.SystemPrompt, CacheControl = new CacheControlEphemeral() }
+            },
+            Messages =
+            [
+                new()
+                {
+                    Role = Role.User,
+                    Content = content
+                }
+            ]
+        };
     }
 
     // Streams the response so the terminal can show work in progress.

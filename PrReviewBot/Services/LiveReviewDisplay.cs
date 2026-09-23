@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text;
 using PrReviewBot.Config;
 using PrReviewBot.Models;
 using Spectre.Console;
@@ -15,14 +16,21 @@ namespace PrReviewBot.Services;
 // picture of a request that is about to exhaust its output budget.
 public sealed class LiveReviewDisplay
 {
+    // A running part that has produced nothing for this long says so, so a
+    // stalled request can be told apart from a slow one at a glance.
+    private static readonly TimeSpan QuietThreshold = TimeSpan.FromSeconds(10);
+
     private readonly ReviewSettings _settings;
+    private readonly TimeProvider _time;
     private readonly Lock _lock = new();
     private readonly List<BatchRow> _rows = [];
     private bool _dirty;
+    private long _lastRenderedSecond = -1;
 
-    public LiveReviewDisplay(ReviewSettings settings)
+    public LiveReviewDisplay(ReviewSettings settings, TimeProvider? time = null)
     {
         _settings = settings;
+        _time = time ?? TimeProvider.System;
     }
 
     public void Plan(IReadOnlyList<BatchInfo> batches)
@@ -54,6 +62,13 @@ public sealed class LiveReviewDisplay
             }
 
             BatchRow row = _rows[update.BatchIndex];
+            DateTimeOffset now = _time.GetUtcNow();
+            row.StartedAt ??= now;
+            if (update.ReasoningChars != row.ReasoningChars || update.AnswerChars != row.AnswerChars)
+            {
+                row.LastOutputAt = now;
+            }
+
             row.ReasoningChars = update.ReasoningChars;
             row.AnswerChars = update.AnswerChars;
             row.Started = true;
@@ -75,6 +90,7 @@ public sealed class LiveReviewDisplay
             {
                 _rows[batchIndex].Finished = true;
                 _rows[batchIndex].Failed = !succeeded;
+                _rows[batchIndex].FinishedAt = _time.GetUtcNow();
                 _dirty = true;
             }
         }
@@ -86,27 +102,75 @@ public sealed class LiveReviewDisplay
     {
         lock (_lock)
         {
-            renderable = Build();
-            bool changed = _dirty;
+            renderable = Build(AnsiConsole.Profile.Width, AnsiConsole.Profile.Height);
+
+            // The timers on running parts change every second even when no
+            // output arrives, which is exactly when they matter.
+            long second = _time.GetUtcNow().ToUnixTimeSeconds();
+            bool clockTicked = second != _lastRenderedSecond && _rows.Exists(r => r.Started && !r.Finished);
+            _lastRenderedSecond = second;
+
+            bool changed = _dirty || clockTicked;
             _dirty = false;
             return changed;
         }
     }
 
-    private IRenderable Build()
+    // Every row is kept to a single line and the whole table inside the
+    // terminal. A live display is repainted by moving the cursor back up by
+    // the height it drew last time; once a row wraps, or the table outgrows
+    // the window, that no longer lines up and each repaint leaves a scrambled
+    // copy of the table behind. The thinking tail was the culprit — up to
+    // ThinkingPreviewChars of free text, wrapping over several lines per row,
+    // with tabs and other control characters in it.
+    internal IRenderable Build(int width, int height)
     {
+        const int LabelMaxWidth = 32;
+        const int NumberWidth = 11;          // "~12,345 tok"
+        const int TableChrome = 5 + (4 * 2); // five borders, one space either side of each column
+        const int FixedLines = 5;            // top border, header, separator, bottom border, one spare
+
+        // In a narrow window the label gives way too, down to a stub, so the
+        // fixed columns alone never force a row to wrap.
+        int available = width - TableChrome - (2 * NumberWidth);
+        int labelMax = Math.Clamp(available / 2, 6, LabelMaxWidth);
+
+        List<(string Label, BatchRow Row)> shown = [];
+        for (int i = 0; i < _rows.Count; i++)
+        {
+            shown.Add((FitStart($"{i + 1}. {_rows[i].Label}", labelMax - 2), _rows[i]));
+        }
+
+        // Too many rows for the window: fold the finished ones into a count,
+        // then cut the list, so the parts still in progress stay visible.
+        int maxRows = Math.Max(1, height - FixedLines - 1);
+        string? summary = null;
+        if (shown.Count > maxRows)
+        {
+            int done = shown.Count(r => r.Row.Finished && !r.Row.Failed);
+            shown = [.. shown.Where(r => !(r.Row.Finished && !r.Row.Failed))];
+
+            int hidden = Math.Max(0, shown.Count - maxRows);
+            shown = [.. shown.Take(maxRows)];
+            summary = string.Create(CultureInfo.InvariantCulture,
+                $"{done} done{(hidden > 0 ? $", {hidden} more not shown" : "")}");
+        }
+
+        int labelWidth = Math.Max(
+            "Part".Length,
+            shown.Select(r => r.Label.GetCellWidth() + 2).DefaultIfEmpty(0).Max());
+        int tailWidth = Math.Max(0, available - labelWidth);
+
         Table table = new Table()
             .Border(TableBorder.Rounded)
             .BorderColor(Color.Grey)
             .AddColumn(new TableColumn("[grey]Part[/]").NoWrap())
             .AddColumn(new TableColumn("[grey]Thinking[/]").RightAligned().NoWrap())
             .AddColumn(new TableColumn("[grey]Answer[/]").RightAligned().NoWrap())
-            .AddColumn(new TableColumn("[grey]Latest thought[/]"));
+            .AddColumn(new TableColumn("[grey]Latest thought[/]").NoWrap());
 
-        for (int i = 0; i < _rows.Count; i++)
+        foreach ((string label, BatchRow row) in shown)
         {
-            BatchRow row = _rows[i];
-
             string status = row switch
             {
                 { Failed: true } => "[red]✗[/]",
@@ -127,13 +191,139 @@ public sealed class LiveReviewDisplay
                 : $"[green]{Approx(row.AnswerChars)}[/]";
 
             table.AddRow(
-                $"{status} {Markup.Escape($"{i + 1}. {row.Label}")}",
+                $"{status} {Markup.Escape(label)}",
                 thinking,
                 answer,
-                $"[grey]{Markup.Escape(row.Finished ? "" : row.Tail.ReplaceLineEndings(" "))}[/]");
+                LatestColumn(row, tailWidth));
+        }
+
+        if (summary is not null)
+        {
+            table.AddRow($"[green]✓[/] {Markup.Escape(summary)}", "", "", "");
         }
 
         return table;
+    }
+
+    // What the part is doing now: the tail of its output while it streams, how
+    // long it has been silent when it stops, or how long it took once done.
+    private string LatestColumn(BatchRow row, int width)
+    {
+        DateTimeOffset now = _time.GetUtcNow();
+
+        if (row.Finished)
+        {
+            string took = row.StartedAt is { } started
+                ? $"{(row.Failed ? "failed after" : "took")} {Duration((row.FinishedAt ?? now) - started)}"
+                : "";
+            return $"[grey]{Markup.Escape(FitEnd(took, width))}[/]";
+        }
+
+        if (row.StartedAt is not { } start)
+        {
+            return "";
+        }
+
+        DateTimeOffset since = row.LastOutputAt ?? start;
+        TimeSpan quiet = now - since;
+        if (quiet >= QuietThreshold)
+        {
+            string text = row.LastOutputAt is null
+                ? $"waiting for the model to start… {Duration(quiet)}"
+                : $"no output for {Duration(quiet)}";
+            return $"[yellow]{Markup.Escape(FitEnd(text, width))}[/]";
+        }
+
+        return $"[grey]{Markup.Escape(FitEnd(SingleLine(row.Tail), width))}[/]";
+    }
+
+    private static string Duration(TimeSpan span) => span.TotalMinutes >= 1
+        ? string.Create(CultureInfo.InvariantCulture, $"{(int)span.TotalMinutes}m {span.Seconds:00}s")
+        : string.Create(CultureInfo.InvariantCulture, $"{Math.Max(0, (int)span.TotalSeconds)}s");
+
+    // Model output flattened to one line of printable text.
+    internal static string SingleLine(string text)
+    {
+        StringBuilder sb = new(text.Length);
+        bool lastWasSpace = false;
+
+        foreach (char c in text)
+        {
+            bool space = char.IsWhiteSpace(c) || char.IsControl(c);
+            if (space)
+            {
+                if (!lastWasSpace)
+                {
+                    sb.Append(' ');
+                }
+            }
+            else
+            {
+                sb.Append(c);
+            }
+
+            lastWasSpace = space;
+        }
+
+        return sb.ToString();
+    }
+
+    // The end of `text` that fits in `width` terminal cells. Measured in cells,
+    // not characters, because CJK text — which some reasoning models think
+    // in — takes two cells per character.
+    internal static string FitEnd(string text, int width)
+    {
+        if (text.GetCellWidth() <= width)
+        {
+            return text;
+        }
+
+        if (width <= 1)
+        {
+            return "";
+        }
+
+        Rune[] runes = [.. text.EnumerateRunes()];
+        int used = 1; // the leading ellipsis
+        int start = runes.Length;
+        while (start > 0)
+        {
+            int w = runes[start - 1].ToString().GetCellWidth();
+            if (used + w > width)
+            {
+                break;
+            }
+
+            used += w;
+            start--;
+        }
+
+        return "…" + string.Concat(runes[start..].Select(r => r.ToString()));
+    }
+
+    // The start of `text` that fits in `width` cells.
+    private static string FitStart(string text, int width)
+    {
+        if (text.GetCellWidth() <= width)
+        {
+            return text;
+        }
+
+        StringBuilder sb = new();
+        int used = 1; // the trailing ellipsis
+        foreach (Rune rune in text.EnumerateRunes())
+        {
+            int w = rune.ToString().GetCellWidth();
+            if (used + w > width)
+            {
+                break;
+            }
+
+            used += w;
+            sb.Append(rune.ToString());
+        }
+
+        return sb.Append('…').ToString();
     }
 
     private static string Approx(int chars) =>
@@ -153,5 +343,8 @@ public sealed class LiveReviewDisplay
         public bool Started { get; set; }
         public bool Finished { get; set; }
         public bool Failed { get; set; }
+        public DateTimeOffset? StartedAt { get; set; }
+        public DateTimeOffset? LastOutputAt { get; set; }
+        public DateTimeOffset? FinishedAt { get; set; }
     }
 }

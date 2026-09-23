@@ -254,7 +254,10 @@ public class ReviewOutputService
                 if (!string.IsNullOrWhiteSpace(comment.CodeExample))
                 {
                     AnsiConsole.Write(new Panel(
-                        new Markup($"[green]{Markup.Escape(comment.CodeExample)}[/]"))
+                        // Tabs are expanded here because the panel counts a tab
+                        // as one column while the terminal draws it as up to
+                        // eight, which pushes lines through the border.
+                        new Markup($"[green]{Markup.Escape(comment.CodeExample.Replace("\t", "    ", StringComparison.Ordinal))}[/]"))
                         .Header("Suggested Code")
                         .BorderColor(Color.Green)
                         .Padding(1, 0));

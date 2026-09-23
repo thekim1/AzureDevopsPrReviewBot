@@ -19,6 +19,12 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
     private readonly int _maxOutputTokens;
     private readonly bool _scopeCommentsToBatch;
     private readonly bool _stream;
+    private readonly TimeSpan _streamIdleTimeout;
+
+    // How long to wait for the usage frame and [DONE] after the model has
+    // finished. Bifrost can keep a finished stream open on heartbeats alone
+    // when the upstream omits [DONE] (maximhq/bifrost#7108).
+    internal TimeSpan FinishGrace { get; init; } = TimeSpan.FromSeconds(10);
 
     private static readonly JsonSerializerOptions _responseJsonOptions = new()
     {
@@ -26,14 +32,20 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
     };
 
     public BifrostReviewService(BifrostSettings settings, ReviewSettings? reviewSettings = null)
+        : this(settings, reviewSettings, new HttpClientHandler())
+    {
+    }
+
+    // Lets tests stand in for the server.
+    internal BifrostReviewService(BifrostSettings settings, ReviewSettings? reviewSettings, HttpMessageHandler handler)
     {
         _settings = settings;
         ReviewSettings review = reviewSettings ?? new ReviewSettings();
         _maxOutputTokens = review.MaxOutputTokens;
         _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
         _stream = review.ShowThinking;
+        _streamIdleTimeout = TimeSpan.FromSeconds(Math.Max(1, review.StreamIdleTimeoutSeconds));
 
-        HttpClientHandler handler = new();
         _httpClient = new HttpClient(handler)
         {
             // Ensure trailing slash so relative paths (e.g. "chat/completions") are
@@ -153,7 +165,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
                     choice?.Message?.ReasoningContent, out List<ReviewComment>? salvaged)
                 && salvaged is not null)
             {
-                Console.WriteLine(
+                DeferredConsole.WriteLine(
                     $"Warning: {_settings.Model} left 'content' empty and answered inside its reasoning; "
                     + $"recovered {salvaged.Count} finding(s) from there. "
                     + "Set Bifrost:ExtraParameters to { \"think\": false } to stop it thinking instead of answering.");
@@ -204,7 +216,9 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
         using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using StreamReader reader = new(stream);
 
-        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        using StreamWatchdog watchdog = new(_streamIdleTimeout, cancellationToken);
+
+        await foreach (string line in StreamLines.ReadAsync(reader, watchdog, cancellationToken))
         {
             if (!line.StartsWith("data:", StringComparison.Ordinal))
             {
@@ -212,9 +226,18 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
             }
 
             string payload = line[5..].Trim();
-            if (payload.Length == 0 || payload == "[DONE]")
+            if (payload.Length == 0)
             {
                 continue;
+            }
+
+            // The end of the answer. The usage chunk comes before this, so
+            // nothing is lost by stopping here — and waiting for the server to
+            // close the connection instead is what hung the review after the
+            // last batch whenever the gateway kept the connection open.
+            if (payload == "[DONE]")
+            {
+                break;
             }
 
             StreamChunk? chunk;
@@ -229,9 +252,20 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
                 continue;
             }
 
+            // A real frame from the model. Heartbeat comments never get here:
+            // they do not start with "data:".
+            watchdog.Kick();
+
             if (chunk?.Usage is not null)
             {
                 usageJson = JsonSerializer.Serialize(chunk.Usage);
+
+                // Usage is the last frame before [DONE]; once the answer is
+                // finished there is nothing further worth waiting for.
+                if (finishReason is not null)
+                {
+                    break;
+                }
             }
 
             StreamChoice? choice = chunk?.Choices?.FirstOrDefault();
@@ -240,7 +274,11 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
                 continue;
             }
 
-            finishReason ??= choice.FinishReason;
+            if (finishReason is null && choice.FinishReason is not null)
+            {
+                finishReason = choice.FinishReason;
+                watchdog.Finishing(FinishGrace);
+            }
 
             string? thought = choice.Delta?.ReasoningContent;
             if (!string.IsNullOrEmpty(thought))
@@ -270,7 +308,7 @@ public sealed class BifrostReviewService : IReviewService, IDisposable
         {
             if (ReviewHelpers.TryFindCommentArray(reasoning.ToString(), out List<ReviewComment>? salvaged))
             {
-                Console.WriteLine(
+                DeferredConsole.WriteLine(
                     $"Warning: {_settings.Model} left 'content' empty and answered inside its reasoning; "
                     + $"recovered {salvaged.Count} finding(s) from there.");
                 return salvaged;

@@ -5,6 +5,11 @@ using PrReviewBot.Services;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
+// Without this a Windows console keeps its legacy code page, and every glyph
+// outside it — ✓, ●, →, emoji — comes out as "V" or "?". Must run before
+// Spectre first inspects the console.
+Console.OutputEncoding = System.Text.Encoding.UTF8;
+
 // The released zip ships appsettings.json next to the executable, so that copy
 // is the one the user edits and it has to be found however the tool is
 // launched. A second, optional file in the working directory stays supported so
@@ -137,19 +142,26 @@ bool postComments = await AnsiConsole.ConfirmAsync(
     "\nPost review comments back to Azure DevOps after each review? (Reviews are always saved to disk.)",
     defaultValue: false);
 
-// Review each PR
-foreach (PullRequestInfo pr in toReview)
+// Review each PR. The next PR's changes are fetched while the current one is
+// being reviewed, so after the first PR there is usually nothing to wait for.
+Prefetcher<PullRequestInfo> prefetcher = new(toReview, devOpsService.LoadPrChangesAsync);
+
+for (int prIndex = 0; prIndex < toReview.Count; prIndex++)
 {
+    PullRequestInfo pr = toReview[prIndex];
     AnsiConsole.WriteLine();
 
     List<PrReviewBot.Models.ReviewComment> comments = [];
     PullRequestReviewResult? reviewResult = null;
-    await AnsiConsole.Status()
-        .Spinner(Spinner.Known.Dots)
-        .StartAsync($"Fetching changes for PR #{pr.Id}...", async ctx =>
-        {
-            await devOpsService.LoadPrChangesAsync(pr);
-        });
+    using (DeferredConsole.Hold())
+    {
+        await AnsiConsole.Status()
+            .Spinner(Spinner.Known.Dots)
+            .StartAsync($"Fetching changes for PR #{pr.Id}...", async ctx =>
+            {
+                await prefetcher.LoadAsync(prIndex);
+            });
+    }
 
     if (pr.ChangedFiles.Count == 0)
     {
@@ -163,78 +175,88 @@ foreach (PullRequestInfo pr in toReview)
         continue;
     }
 
-    if (settings.Review.ShowThinking)
+    // Warnings raised while the display is up — by the provider, or by the
+    // next PR loading in the background — are printed once it is gone rather
+    // than drawn into the middle of it.
+    using (DeferredConsole.Hold())
     {
-        // Watch the model work. The reasoning counter climbing while the
-        // answer stays empty is what an exhausted output budget looks like
-        // before it fails, so this is diagnostic as well as reassuring.
-        LiveReviewDisplay display = new(settings.Review);
-        AnsiConsole.MarkupLine($"[grey]Reviewing PR #{pr.Id} with {provider} — live:[/]");
+        if (settings.Review.ShowThinking)
+        {
+            // Watch the model work. The reasoning counter climbing while the
+            // answer stays empty is what an exhausted output budget looks like
+            // before it fails, so this is diagnostic as well as reassuring.
+            LiveReviewDisplay display = new(settings.Review);
+            AnsiConsole.MarkupLine($"[grey]Reviewing PR #{pr.Id} with {provider} — live:[/]");
 
-        await AnsiConsole.Live(new Table().AddColumn(" "))
-            .AutoClear(false)
-            .StartAsync(async liveCtx =>
-            {
-                using CancellationTokenSource cts = new();
-                Task painter = RepaintAsync(liveCtx, display, cts.Token);
-
-                try
+            await AnsiConsole.Live(new Table().AddColumn(" "))
+                .AutoClear(false)
+                // The display already sizes itself to the window; this is the
+                // backstop for a window resized smaller mid-review.
+                .Overflow(VerticalOverflow.Ellipsis)
+                .Cropping(VerticalOverflowCropping.Bottom)
+                .StartAsync(async liveCtx =>
                 {
-                    reviewResult = await reviewer.ReviewAsync(
-                        pr,
-                        progress: null,
-                        liveProgress: new SynchronousProgress(display.Report),
-                        onBatchesPlanned: display.Plan,
-                        onBatchCompleted: display.Complete);
-                    comments = reviewResult.Comments;
-                }
-                finally
-                {
-                    await cts.CancelAsync();
-                    await painter;
+                    using CancellationTokenSource cts = new();
+                    Task painter = RepaintAsync(liveCtx, display, cts.Token);
 
-                    // One final paint so the finished state is what remains
-                    // on screen.
-                    display.TryRender(out IRenderable final);
-                    liveCtx.UpdateTarget(final);
-                    liveCtx.Refresh();
-                }
-            });
-    }
-    else
-    {
-        await AnsiConsole.Status()
-            .Spinner(Spinner.Known.Dots)
-            .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
-            {
-                string[] messages =
-                [
-                    "The AI is staring at your diff very intensely 👀",
-                    "Consulting the silicon oracle...",
-                    "Generating opinions at scale 🤖",
-                    "The model is judging your variable names. Quietly.",
-                    "Running on vibes and matrix multiplications.",
-                    "Almost done — the AI is just adding dramatic tension.",
-                    "Cross-referencing your code with every Stack Overflow post ever 📚",
-                    "The tokens are flowing. Wisdom may follow.",
-                ];
+                    try
+                    {
+                        reviewResult = await reviewer.ReviewAsync(
+                            pr,
+                            progress: null,
+                            liveProgress: new SynchronousProgress(display.Report),
+                            onBatchesPlanned: display.Plan,
+                            onBatchCompleted: display.Complete);
+                        comments = reviewResult.Comments;
+                    }
+                    finally
+                    {
+                        await cts.CancelAsync();
+                        await painter;
 
-                using CancellationTokenSource cts = new();
-                Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+                        // One final paint so the finished state is what remains
+                        // on screen.
+                        display.TryRender(out IRenderable final);
+                        liveCtx.UpdateTarget(final);
+                        liveCtx.Refresh();
+                    }
+                });
+        }
+        else
+        {
+            await AnsiConsole.Status()
+                .Spinner(Spinner.Known.Dots)
+                .StartAsync($"Reviewing PR #{pr.Id} with {provider}...", async ctx =>
+                {
+                    string[] messages =
+                    [
+                        "The AI is staring at your diff very intensely 👀",
+                        "Consulting the silicon oracle...",
+                        "Generating opinions at scale 🤖",
+                        "The model is judging your variable names. Quietly.",
+                        "Running on vibes and matrix multiplications.",
+                        "Almost done — the AI is just adding dramatic tension.",
+                        "Cross-referencing your code with every Stack Overflow post ever 📚",
+                        "The tokens are flowing. Wisdom may follow.",
+                    ];
 
-                try
-                {
-                    // The PR is reviewed in batches; a batch that fails costs
-                    // its own files, not the whole review.
-                    reviewResult = await reviewer.ReviewAsync(pr, status => ctx.Status(status));
-                    comments = reviewResult.Comments;
-                }
-                finally
-                {
-                    await cts.CancelAsync();
-                    await tickerTask;
-                }
-            });
+                    using CancellationTokenSource cts = new();
+                    Task tickerTask = StartFunnyTickerAsync(ctx, messages, cts.Token);
+
+                    try
+                    {
+                        // The PR is reviewed in batches; a batch that fails costs
+                        // its own files, not the whole review.
+                        reviewResult = await reviewer.ReviewAsync(pr, status => ctx.Status(status));
+                        comments = reviewResult.Comments;
+                    }
+                    finally
+                    {
+                        await cts.CancelAsync();
+                        await tickerTask;
+                    }
+                });
+        }
     }
 
     if (reviewResult is not null && reviewResult.Failures.Count != 0)

@@ -141,72 +141,88 @@ internal static class ReviewHelpers
 
     public static string BuildReviewPrompt(
         PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true)
+        => BuildReviewPromptParts(pr, files, scopeCommentsToBatch).Full;
+
+    // Builds the prompt in two parts: everything that is the same for every
+    // batch of this PR, then everything specific to this batch.
+    //
+    // Prompt caches match on an exact prefix, so anything batch-specific that
+    // appears early ends the shared part there. Keeping all of the PR-wide
+    // material ahead of the first batch-specific line is what lets every batch
+    // after the first read that material from the cache. Providers that need an
+    // explicit cache breakpoint (Anthropic) place it between the two parts.
+    public static ReviewPrompt BuildReviewPromptParts(
+        PullRequestInfo pr, IReadOnlyList<ChangedFile> files, bool scopeCommentsToBatch = true)
     {
-        StringBuilder sb = new();
+        StringBuilder shared = new();
 
         // Repository conventions come first: they frame everything that
         // follows, and they are identical for every PR in the repo, which
         // keeps them at a stable prefix position for prompt caching.
         if (pr.RepoContext.Count != 0)
         {
-            sb.AppendLine("=== REPOSITORY CONTEXT (authoritative conventions for this codebase — prefer these over generic best practice) ===");
+            shared.AppendLine("=== REPOSITORY CONTEXT (authoritative conventions for this codebase — prefer these over generic best practice) ===");
             foreach (RepoContextFile file in pr.RepoContext)
             {
-                sb.AppendLine(CultureInfo.InvariantCulture, $"--- {file.Path} ---");
-                sb.AppendLine(file.Content);
+                shared.AppendLine(CultureInfo.InvariantCulture, $"--- {file.Path} ---");
+                shared.AppendLine(file.Content);
                 if (file.IsTruncated)
                 {
-                    sb.AppendLine("[... truncated ...]");
+                    shared.AppendLine("[... truncated ...]");
                 }
 
-                sb.AppendLine();
+                shared.AppendLine();
             }
 
-            sb.AppendLine("=== END REPOSITORY CONTEXT ===");
-            sb.AppendLine();
+            shared.AppendLine("=== END REPOSITORY CONTEXT ===");
+            shared.AppendLine();
         }
 
-        sb.AppendLine("Review this Pull Request:");
-        sb.AppendLine(CultureInfo.InvariantCulture, $"Repository: {pr.RepositoryName}");
-        sb.AppendLine(CultureInfo.InvariantCulture, $"Title: {pr.Title}");
-        sb.AppendLine(CultureInfo.InvariantCulture, $"Author: {pr.Author}");
-        sb.AppendLine(CultureInfo.InvariantCulture, $"Branch: {pr.SourceBranch} → {pr.TargetBranch}");
+        shared.AppendLine("Review this Pull Request:");
+        shared.AppendLine(CultureInfo.InvariantCulture, $"Repository: {pr.RepositoryName}");
+        shared.AppendLine(CultureInfo.InvariantCulture, $"Title: {pr.Title}");
+        shared.AppendLine(CultureInfo.InvariantCulture, $"Author: {pr.Author}");
+        shared.AppendLine(CultureInfo.InvariantCulture, $"Branch: {pr.SourceBranch} → {pr.TargetBranch}");
         if (!string.IsNullOrWhiteSpace(pr.Description))
         {
-            sb.AppendLine(CultureInfo.InvariantCulture, $"Description: {pr.Description}");
+            shared.AppendLine(CultureInfo.InvariantCulture, $"Description: {pr.Description}");
         }
+
+        if (pr.SkippedFiles.Count != 0)
+        {
+            shared.AppendLine();
+            shared.AppendLine("=== FILES CHANGED BUT NOT SHOWN TO YOU (do not reason about these, and do not comment on them) ===");
+            foreach (SkippedFile skipped in pr.SkippedFiles)
+            {
+                shared.AppendLine(CultureInfo.InvariantCulture, $"{skipped.Path} — {skipped.Reason}");
+            }
+        }
+
+        StringBuilder batch = new();
 
         // Only comments about files in this batch (plus PR-level ones). A
         // comment on a file the model cannot see is noise it must read and pay
-        // for, in every batch.
+        // for, in every batch. Unscoped, the comments are the same for every
+        // batch and belong in the shared part.
         List<PrComment> relevantComments = scopeCommentsToBatch
             ? [.. pr.ExistingComments.Where(c => c.FilePath is null || MentionsAnyOf(c.FilePath, files))]
             : pr.ExistingComments;
 
         if (relevantComments.Count != 0)
         {
-            sb.AppendLine();
-            sb.AppendLine("=== EXISTING PR COMMENTS (already made by others — take these into account; do not repeat or contradict them) ===");
+            StringBuilder target = scopeCommentsToBatch ? batch : shared;
+            target.AppendLine();
+            target.AppendLine("=== EXISTING PR COMMENTS (already made by others — take these into account; do not repeat or contradict them) ===");
             foreach (PrComment c in relevantComments)
             {
                 string location = c.FilePath is not null
                     ? $" [{c.FilePath}{(c.LineNumber.HasValue ? $":{c.LineNumber}" : "")}]"
                     : " [PR-level]";
-                sb.AppendLine(CultureInfo.InvariantCulture, $"{c.Author}{location}: {c.Content}");
+                target.AppendLine(CultureInfo.InvariantCulture, $"{c.Author}{location}: {c.Content}");
             }
         }
 
-        if (pr.SkippedFiles.Count != 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine("=== FILES CHANGED BUT NOT SHOWN TO YOU (do not reason about these, and do not comment on them) ===");
-            foreach (SkippedFile skipped in pr.SkippedFiles)
-            {
-                sb.AppendLine(CultureInfo.InvariantCulture, $"{skipped.Path} — {skipped.Reason}");
-            }
-        }
-
-        sb.AppendLine();
+        batch.AppendLine();
 
         // Only the files in this batch. Files from the PR's other batches are
         // deliberately not mentioned: naming them invites the model to reason
@@ -214,24 +230,24 @@ internal static class ReviewHelpers
         // partial-view rule above exists to prevent.
         foreach (ChangedFile file in files)
         {
-            sb.AppendLine(CultureInfo.InvariantCulture, $"=== FILE: {file.Path} ({file.ChangeType}) ===");
+            batch.AppendLine(CultureInfo.InvariantCulture, $"=== FILE: {file.Path} ({file.ChangeType}) ===");
             if (file.NewFileLineCount > 0)
             {
-                sb.AppendLine(CultureInfo.InvariantCulture,
+                batch.AppendLine(CultureInfo.InvariantCulture,
                     $"The full file is {file.NewFileLineCount} lines; only changed regions and nearby context are shown below.");
             }
 
             if (file.IsTruncated)
             {
-                sb.AppendLine("WARNING: this diff was truncated. Do not draw any conclusion about code that is not shown.");
+                batch.AppendLine("WARNING: this diff was truncated. Do not draw any conclusion about code that is not shown.");
             }
 
-            sb.AppendLine("Format: <sign><lineNumber> | <content>  (+ added / - removed / space unchanged)");
-            sb.AppendLine(file.Diff);
-            sb.AppendLine();
+            batch.AppendLine("Format: <sign><lineNumber> | <content>  (+ added / - removed / space unchanged)");
+            batch.AppendLine(file.Diff);
+            batch.AppendLine();
         }
 
-        return sb.ToString();
+        return new ReviewPrompt(shared.ToString(), batch.ToString());
     }
 
     private static bool MentionsAnyOf(string commentPath, IReadOnlyList<ChangedFile> files)
@@ -459,4 +475,11 @@ internal static class ReviewHelpers
         int closing = body.LastIndexOf("```", StringComparison.Ordinal);
         return (closing >= 0 ? body[..closing] : body).Trim();
     }
+}
+
+// A review prompt split where the batch-specific content begins.
+// SharedPrefix is identical for every batch of the same PR.
+internal sealed record ReviewPrompt(string SharedPrefix, string BatchSuffix)
+{
+    public string Full => SharedPrefix + BatchSuffix;
 }

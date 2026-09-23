@@ -18,6 +18,7 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
     private readonly int _maxOutputTokens;
     private readonly bool _scopeCommentsToBatch;
     private readonly bool _stream;
+    private readonly TimeSpan _streamIdleTimeout;
 
     private static readonly JsonSerializerOptions _responseJsonOptions = new()
     {
@@ -25,14 +26,20 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
     };
 
     public OllamaReviewService(OllamaSettings settings, ReviewSettings? reviewSettings = null)
+        : this(settings, reviewSettings, new HttpClientHandler())
+    {
+    }
+
+    // Lets tests stand in for the server.
+    internal OllamaReviewService(OllamaSettings settings, ReviewSettings? reviewSettings, HttpMessageHandler handler)
     {
         _settings = settings;
         ReviewSettings review = reviewSettings ?? new ReviewSettings();
         _maxOutputTokens = review.MaxOutputTokens;
         _scopeCommentsToBatch = review.ScopeExistingCommentsToBatch;
         _stream = review.ShowThinking;
+        _streamIdleTimeout = TimeSpan.FromSeconds(Math.Max(1, review.StreamIdleTimeoutSeconds));
 
-        HttpClientHandler handler = new();
         _httpClient = new HttpClient(handler)
         {
             // Ensure trailing slash so relative paths (e.g. "generate") are appended
@@ -121,7 +128,9 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
         using Stream stream = await response.Content.ReadAsStreamAsync(cancellationToken);
         using StreamReader reader = new(stream);
 
-        while (await reader.ReadLineAsync(cancellationToken) is { } line)
+        using StreamWatchdog watchdog = new(_streamIdleTimeout, cancellationToken);
+
+        await foreach (string line in StreamLines.ReadAsync(reader, watchdog, cancellationToken))
         {
             if (string.IsNullOrWhiteSpace(line))
             {
@@ -144,6 +153,8 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
                 continue;
             }
 
+            watchdog.Kick();
+
             doneReason ??= chunk.DoneReason;
 
             if (!string.IsNullOrEmpty(chunk.Thinking))
@@ -159,13 +170,20 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
                 progress?.Report(new ReviewProgress(
                     0, reasoning.Length, answer.Length, chunk.Response, IsAnswer: true));
             }
+
+            // The final object. Stop here rather than waiting for the server
+            // to close the connection, which it is not obliged to do promptly.
+            if (chunk.Done)
+            {
+                break;
+            }
         }
 
         if (answer.Length == 0)
         {
             if (ReviewHelpers.TryFindCommentArray(reasoning.ToString(), out List<ReviewComment>? salvaged))
             {
-                Console.WriteLine(
+                DeferredConsole.WriteLine(
                     $"Warning: {_settings.Model} produced no answer but one was recoverable from its "
                     + $"thinking ({salvaged.Count} finding(s)).");
                 return salvaged;
@@ -189,6 +207,9 @@ public sealed class OllamaReviewService : IReviewService, IDisposable
     {
         [JsonPropertyName("response")]
         public string? Response { get; set; }
+
+        [JsonPropertyName("done")]
+        public bool Done { get; set; }
 
         [JsonPropertyName("done_reason")]
         public string? DoneReason { get; set; }

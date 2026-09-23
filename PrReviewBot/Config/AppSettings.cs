@@ -169,6 +169,12 @@ public class ReviewSettings
     // `max_conns_per_host`, which defaults to 3.
     public int MaxParallelRequests { get; set; } = 3;
 
+    // How many file reads and listings may be in flight against Azure DevOps
+    // at once, across everything the tool is loading. Fetching a PR reads two
+    // versions of every changed file; one at a time, that was most of the wait
+    // before a review could start. Lower it if Azure DevOps starts throttling.
+    public int MaxParallelDevOpsRequests { get; set; } = 8;
+
     // Stream the model's output and show it live in the terminal.
     //
     // Worth having on for two reasons beyond looking good: a reasoning model
@@ -180,6 +186,13 @@ public class ReviewSettings
     // Streaming still reports usage to the gateway (stream_options.include_usage
     // is sent), so cost and token tracking are unaffected.
     public bool ShowThinking { get; set; } = true;
+
+    // A streamed request that sends nothing for this long is abandoned and its
+    // batch reported as failed, instead of waiting forever. A reasoning model
+    // streams its thinking continuously once it starts, so the only long quiet
+    // stretch in a healthy request is the wait for the first token — which
+    // includes queueing behind other requests at the gateway.
+    public int StreamIdleTimeoutSeconds { get; set; } = 180;
 
     // How many characters of the model's thinking to keep on screen per batch.
     public int ThinkingPreviewChars { get; set; } = 220;

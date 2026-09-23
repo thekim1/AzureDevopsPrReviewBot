@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text;
 using Microsoft.TeamFoundation.SourceControl.WebApi;
@@ -12,19 +13,31 @@ public class AzureDevOpsService
 {
     private const string RefsHeadsPrefix = "refs/heads/";
 
+    // Page size for the project-wide PR listing. The API returns a limited
+    // number of results per call when no page size is given.
+    private const int PullRequestPageSize = 500;
+
     private readonly AzureDevOpsSettings _settings;
     private readonly ReviewSettings _reviewSettings;
     private readonly VssConnection _connection;
 
     // Repository conventions are identical for every PR in a repo, so they are
-    // fetched once per (repo, target branch) per run instead of per PR.
-    private readonly Dictionary<string, List<RepoContextFile>> _repoContextCache =
+    // fetched once per (repo, target branch) per run instead of per PR. The
+    // task is cached, not the result, so two PRs loading at the same time share
+    // one fetch instead of racing to make two.
+    private readonly ConcurrentDictionary<string, Lazy<Task<List<RepoContextFile>>>> _repoContextCache =
         new(StringComparer.OrdinalIgnoreCase);
+
+    // Caps concurrent file reads across everything this service does,
+    // including a PR being prefetched while another is loading. Reading files
+    // one at a time was most of the wait before a review could start.
+    private readonly SemaphoreSlim _readGate;
 
     public AzureDevOpsService(AzureDevOpsSettings settings, ReviewSettings? reviewSettings = null)
     {
         _settings = settings;
         _reviewSettings = reviewSettings ?? new ReviewSettings();
+        _readGate = new SemaphoreSlim(Math.Max(1, _reviewSettings.MaxParallelDevOpsRequests));
         VssBasicCredential credentials = new(string.Empty, settings.PersonalAccessToken);
         _connection = new VssConnection(new Uri(settings.OrganizationUrl), credentials);
     }
@@ -39,55 +52,71 @@ public class AzureDevOpsService
     public async Task<List<PullRequestInfo>> GetAllActivePullRequestsAsync()
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
-        List<GitRepository> repos = await gitClient.GetRepositoriesAsync(_settings.Project);
 
-        // Filter out disabled repositories — they are returned by GetRepositoriesAsync
-        // but throw TF401019 when used in subsequent API calls like GetPullRequestsAsync
-        repos = [.. repos.Where(r => r.IsDisabled != true)];
+        GitPullRequestSearchCriteria searchCriteria = new()
+        {
+            Status = PullRequestStatus.Active
+        };
 
+        // One project-wide listing instead of one listing per repository, and
+        // the three independent calls in parallel rather than one after another.
+        Task<List<GitRepository>> reposTask = gitClient.GetRepositoriesAsync(_settings.Project);
+        Task<Guid> reviewerTask = GetCurrentUserIdAsync();
+        Task<List<GitPullRequest>> prsTask = ConcurrencyHelpers.ReadAllPagesAsync(
+            PullRequestPageSize,
+            (skip, top) => gitClient.GetPullRequestsByProjectAsync(
+                _settings.Project, searchCriteria, skip: skip, top: top));
+
+        await Task.WhenAll(reposTask, reviewerTask, prsTask);
+
+        // Disabled repositories are returned by GetRepositoriesAsync but throw
+        // TF401019 when used in subsequent API calls, so their PRs are left out.
+        // Listing order follows the repository list, as it did when PRs were
+        // fetched repository by repository.
+        Dictionary<Guid, int> repoOrder = [];
+        foreach (GitRepository repo in reposTask.Result)
+        {
+            if (repo.IsDisabled != true)
+            {
+                repoOrder[repo.Id] = repoOrder.Count;
+            }
+        }
+
+        Guid reviewerId = reviewerTask.Result;
         List<PullRequestInfo> result = [];
 
-        Guid reviewerId = await GetCurrentUserIdAsync();
+        IEnumerable<GitPullRequest> prs = prsTask.Result
+            .Where(pr => pr.Repository is not null && repoOrder.ContainsKey(pr.Repository.Id))
+            .OrderBy(pr => repoOrder[pr.Repository.Id]);
 
-        foreach (GitRepository? repo in repos)
+        foreach (GitPullRequest pr in prs)
         {
-            GitPullRequestSearchCriteria searchCriteria = new()
+            if (pr.IsDraft == true)
             {
-                Status = PullRequestStatus.Active
-            };
-
-            // Fix CS1744: remove duplicate positional+named project args
-            List<GitPullRequest> prs = await gitClient.GetPullRequestsAsync(
-                _settings.Project, repo.Id, searchCriteria);
-
-            foreach (GitPullRequest? pr in prs)
-            {
-                if (pr.IsDraft == true)
-                {
-                    continue;
-                }
-
-                bool isAssignedToMe = pr.Reviewers is not null
-                    && pr.Reviewers.Any(r => Guid.TryParse(r.Id, out Guid id) && id == reviewerId);
-                bool hasReviewers = pr.Reviewers is not null && pr.Reviewers.Length != 0;
-                result.Add(new PullRequestInfo
-                {
-                    Id = pr.PullRequestId,
-                    Title = pr.Title,
-                    Description = pr.Description ?? "",
-                    Author = pr.CreatedBy.DisplayName,
-                    SourceBranch = pr.SourceRefName.Replace(RefsHeadsPrefix, ""),
-                    TargetBranch = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
-                    RepositoryName = repo.Name,
-                    RepositoryId = repo.Id.ToString(),
-                    // Diffs are not fetched here — the listing only needs metadata.
-                    // Call LoadPrChangesAsync for selected PRs before reviewing.
-                    ChangedFiles = [],
-                    Url = $"{_settings.OrganizationUrl}/{_settings.Project}/_git/{repo.Name}/pullrequest/{pr.PullRequestId}",
-                    IsAssignedToMe = isAssignedToMe,
-                    HasReviewers = hasReviewers
-                });
+                continue;
             }
+
+            GitRepository repo = pr.Repository;
+            bool isAssignedToMe = pr.Reviewers is not null
+                && pr.Reviewers.Any(r => Guid.TryParse(r.Id, out Guid id) && id == reviewerId);
+            bool hasReviewers = pr.Reviewers is not null && pr.Reviewers.Length != 0;
+            result.Add(new PullRequestInfo
+            {
+                Id = pr.PullRequestId,
+                Title = pr.Title,
+                Description = pr.Description ?? "",
+                Author = pr.CreatedBy.DisplayName,
+                SourceBranch = pr.SourceRefName.Replace(RefsHeadsPrefix, ""),
+                TargetBranch = pr.TargetRefName.Replace(RefsHeadsPrefix, ""),
+                RepositoryName = repo.Name,
+                RepositoryId = repo.Id.ToString(),
+                // Diffs are not fetched here — the listing only needs metadata.
+                // Call LoadPrChangesAsync for selected PRs before reviewing.
+                ChangedFiles = [],
+                Url = $"{_settings.OrganizationUrl}/{_settings.Project}/_git/{repo.Name}/pullrequest/{pr.PullRequestId}",
+                IsAssignedToMe = isAssignedToMe,
+                HasReviewers = hasReviewers
+            });
         }
 
         return result;
@@ -99,16 +128,24 @@ public class AzureDevOpsService
     public async Task LoadPrChangesAsync(PullRequestInfo pr)
     {
         GitHttpClient gitClient = await _connection.GetClientAsync<GitHttpClient>();
-        (List<ChangedFile> files, List<SkippedFile> skipped, int iterationId) = await GetPrChangesAsync(
-            gitClient, pr.RepositoryId, pr.Id, RefsHeadsPrefix + pr.TargetBranch);
+
+        // The three are independent, so they are fetched side by side.
+        Task<(List<ChangedFile> Files, List<SkippedFile> Skipped, int IterationId)> changesTask =
+            GetPrChangesAsync(gitClient, pr.RepositoryId, pr.Id, RefsHeadsPrefix + pr.TargetBranch);
+        Task<List<PrComment>> commentsTask = GetPrCommentsAsync(gitClient, pr.RepositoryId, pr.Id);
+        Task<List<RepoContextFile>>? contextTask = _reviewSettings.IncludeRepoContext
+            ? GetRepoContextAsync(gitClient, pr.RepositoryId, pr.TargetBranch)
+            : null;
+
+        (List<ChangedFile> files, List<SkippedFile> skipped, int iterationId) = await changesTask;
         pr.ChangedFiles = files;
         pr.SkippedFiles = skipped;
         pr.LatestIterationId = iterationId;
-        pr.ExistingComments = await GetPrCommentsAsync(gitClient, pr.RepositoryId, pr.Id);
+        pr.ExistingComments = await commentsTask;
 
-        if (_reviewSettings.IncludeRepoContext)
+        if (contextTask is not null)
         {
-            pr.RepoContext = await GetRepoContextAsync(gitClient, pr.RepositoryId, pr.TargetBranch);
+            pr.RepoContext = await contextTask;
         }
     }
 
@@ -117,72 +154,73 @@ public class AzureDevOpsService
     // build/style configuration — from the PR's target branch. Without these
     // the model reviews against generic best practice and flags deliberate
     // project conventions as defects.
-    private async Task<List<RepoContextFile>> GetRepoContextAsync(
+    private Task<List<RepoContextFile>> GetRepoContextAsync(
+        GitHttpClient gitClient, string repoId, string targetBranch)
+        => _repoContextCache.GetOrAdd(
+            $"{repoId}@{targetBranch}",
+            _ => new Lazy<Task<List<RepoContextFile>>>(
+                () => FetchRepoContextAsync(gitClient, repoId, targetBranch))).Value;
+
+    private async Task<List<RepoContextFile>> FetchRepoContextAsync(
         GitHttpClient gitClient, string repoId, string targetBranch)
     {
-        string cacheKey = $"{repoId}@{targetBranch}";
-        if (_repoContextCache.TryGetValue(cacheKey, out List<RepoContextFile>? cached))
-        {
-            return cached;
-        }
-
-        List<RepoContextFile> result = [];
-        int budget = _reviewSettings.MaxRepoContextChars;
-
         GitVersionDescriptor version = new()
         {
             Version = targetBranch,
             VersionType = GitVersionType.Branch
         };
 
-        foreach (RepoContextGroup group in _reviewSettings.RepoContextFileGroups)
+        List<RepoContextGroup> groups = _reviewSettings.RepoContextFileGroups;
+
+        // List the handful of folders the candidates live in, then read only
+        // the candidates that exist.
+        string[][] listings = await Task.WhenAll(RepoContextPlanner.DirectoriesToList(groups)
+            .Select(dir => ListFilesAsync(gitClient, repoId, dir, version)));
+        HashSet<string> existing = new(listings.SelectMany(l => l), StringComparer.Ordinal);
+
+        List<List<string>> candidates = RepoContextPlanner.ResolveCandidates(groups, existing);
+
+        (string Path, string? Content)[][] fetched = await Task.WhenAll(candidates.Select(async group =>
+            await Task.WhenAll(group.Select(async path => (path, await TryReadAsync(gitClient, repoId, path, version))))));
+
+        return RepoContextPlanner.Assemble(
+            fetched, _reviewSettings.MaxRepoContextChars, _reviewSettings.MaxRepoContextFileChars);
+    }
+
+    // Paths of the files directly inside one folder. A folder that does not
+    // exist is expected for most of the candidate list, so it is not reported.
+    private async Task<string[]> ListFilesAsync(
+        GitHttpClient gitClient, string repoId, string directory, GitVersionDescriptor version)
+    {
+        await _readGate.WaitAsync();
+        try
         {
-            if (budget <= 0)
-            {
-                break;
-            }
-
-            // First hit wins: the alternatives within a group are different
-            // names for the same kind of document, not extra information.
-            foreach (string path in group.Paths)
-            {
-                string content;
-                try
-                {
-                    content = await ReadStreamAsync(gitClient, repoId, path, version);
-                }
-                catch
-                {
-                    // File simply does not exist in this repo — expected for
-                    // most of the candidate list, so not worth reporting.
-                    continue;
-                }
-
-                if (string.IsNullOrWhiteSpace(content))
-                {
-                    continue;
-                }
-
-                int limit = Math.Min(_reviewSettings.MaxRepoContextFileChars, budget);
-                bool truncated = content.Length > limit;
-                if (truncated)
-                {
-                    content = content[..limit];
-                }
-
-                budget -= content.Length;
-                result.Add(new RepoContextFile
-                {
-                    Path = path,
-                    Content = content,
-                    IsTruncated = truncated
-                });
-                break;
-            }
+            List<GitItem> items = await gitClient.GetItemsAsync(
+                repoId, scopePath: directory, recursionLevel: VersionControlRecursionType.OneLevel,
+                versionDescriptor: version);
+            return [.. items.Where(i => !i.IsFolder && !string.IsNullOrEmpty(i.Path)).Select(i => i.Path)];
         }
+        catch
+        {
+            return [];
+        }
+        finally
+        {
+            _readGate.Release();
+        }
+    }
 
-        _repoContextCache[cacheKey] = result;
-        return result;
+    private async Task<string?> TryReadAsync(
+        GitHttpClient gitClient, string repoId, string path, GitVersionDescriptor version)
+    {
+        try
+        {
+            return await ReadStreamAsync(gitClient, repoId, path, version);
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     // Fetches existing comment threads on the PR so the reviewer is aware of
@@ -237,7 +275,7 @@ public class AzureDevOpsService
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Warning: Could not get comments for PR #{prId}: {ex.Message}");
+            DeferredConsole.WriteLine($"Warning: Could not get comments for PR #{prId}: {ex.Message}");
         }
 
         return result;
@@ -280,9 +318,9 @@ public class AzureDevOpsService
             GitPullRequestIterationChanges changes = await gitClient.GetPullRequestIterationChangesAsync(
                 _settings.Project, repoId, prId, iterationId);
 
-            List<GitPullRequestChange> entries = [.. changes.ChangeEntries];
+            List<GitPullRequestChange> candidates = [];
 
-            foreach (GitPullRequestChange? change in entries)
+            foreach (GitPullRequestChange? change in changes.ChangeEntries)
             {
                 string? filePath = change.Item?.Path;
                 if (string.IsNullOrEmpty(filePath))
@@ -301,19 +339,23 @@ public class AzureDevOpsService
                     continue;
                 }
 
-                if (result.Count >= _reviewSettings.MaxFilesPerPr)
-                {
-                    skipped.Add(new SkippedFile
-                    {
-                        Path = filePath,
-                        Reason = $"over the {_reviewSettings.MaxFilesPerPr}-file review limit"
-                    });
-                    continue;
-                }
+                candidates.Add(change);
+            }
 
-                DiffBuilder.DiffResult diff = await GetFileDiffAsync(
-                    gitClient, repoId, filePath, change.ChangeType,
-                    sourceVersion, baseVersion, _reviewSettings);
+            // Diffs are fetched concurrently, but the files accepted are the
+            // same ones, in the same order, as reading them one by one up to
+            // the limit would give: a file that cannot be diffed does not use
+            // up a place.
+            LimitedSelection<GitPullRequestChange, DiffBuilder.DiffResult> selection =
+                await ConcurrencyHelpers.SelectUpToLimitAsync(
+                    candidates,
+                    _reviewSettings.MaxFilesPerPr,
+                    change => GetFileDiffAsync(gitClient, repoId, change, sourceVersion, baseVersion),
+                    diff => diff.Success);
+
+            foreach ((GitPullRequestChange change, DiffBuilder.DiffResult diff) in selection.Fetched)
+            {
+                string filePath = change.Item.Path;
 
                 if (!diff.Success)
                 {
@@ -331,10 +373,19 @@ public class AzureDevOpsService
                     ChangeTrackingId = change.ChangeTrackingId
                 });
             }
+
+            foreach (GitPullRequestChange change in selection.NotFetched)
+            {
+                skipped.Add(new SkippedFile
+                {
+                    Path = change.Item.Path,
+                    Reason = $"over the {_reviewSettings.MaxFilesPerPr}-file review limit"
+                });
+            }
         }
         catch (Exception ex)
         {
-            Console.WriteLine($"Warning: Could not get changes for PR #{prId}: {ex.Message}");
+            DeferredConsole.WriteLine($"Warning: Could not get changes for PR #{prId}: {ex.Message}");
         }
 
         return (result, skipped, iterationId);
@@ -348,42 +399,65 @@ public class AzureDevOpsService
     private static GitVersionDescriptor BranchVersion(string refName)
         => new() { Version = refName.Replace(RefsHeadsPrefix, ""), VersionType = GitVersionType.Branch };
 
-    private static async Task<DiffBuilder.DiffResult> GetFileDiffAsync(
-        GitHttpClient gitClient, string repoId, string filePath,
-        VersionControlChangeType changeType,
-        GitVersionDescriptor sourceVersion, GitVersionDescriptor baseVersion,
-        ReviewSettings reviewSettings)
+    // Where the file's previous version lives in the merge base. For a rename
+    // that is its old path: reading the new path there finds nothing, which
+    // turned every renamed file into a whole-file addition and hid the few
+    // lines that actually changed.
+    internal static string BasePathFor(GitPullRequestChange change)
     {
-        string oldContent = "";
-        string newContent = "";
+        string path = change.Item?.Path ?? "";
 
-        bool isAdd = changeType.HasFlag(VersionControlChangeType.Add);
-        bool isDelete = changeType.HasFlag(VersionControlChangeType.Delete);
+        if (!change.ChangeType.HasFlag(VersionControlChangeType.Rename))
+        {
+            return path;
+        }
 
+        string? original = !string.IsNullOrEmpty(change.OriginalPath)
+            ? change.OriginalPath
+            : change.SourceServerItem;
+
+        return string.IsNullOrEmpty(original) ? path : original;
+    }
+
+    private async Task<DiffBuilder.DiffResult> GetFileDiffAsync(
+        GitHttpClient gitClient, string repoId, GitPullRequestChange change,
+        GitVersionDescriptor sourceVersion, GitVersionDescriptor baseVersion)
+    {
+        string filePath = change.Item.Path;
+        bool isAdd = change.ChangeType.HasFlag(VersionControlChangeType.Add);
+        bool isDelete = change.ChangeType.HasFlag(VersionControlChangeType.Delete);
+
+        // Both sides at once; they do not depend on each other.
+        Task<string> newTask = isDelete
+            ? Task.FromResult("")
+            : ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
+        Task<string> oldTask = isAdd
+            ? Task.FromResult("")
+            : ReadStreamAsync(gitClient, repoId, BasePathFor(change), baseVersion);
+
+        string newContent;
         try
         {
-            if (!isDelete)
-            {
-                newContent = await ReadStreamAsync(gitClient, repoId, filePath, sourceVersion);
-            }
+            newContent = await newTask;
         }
         catch (Exception ex)
         {
+            // Observe the other read so its failure is not left unobserved.
+            await oldTask.ContinueWith(_ => { }, TaskScheduler.Default);
             return DiffBuilder.DiffResult.Failed($"could not read the new version ({ex.GetType().Name})");
         }
 
+        string oldContent;
         try
         {
-            if (!isAdd)
-            {
-                oldContent = await ReadStreamAsync(gitClient, repoId, filePath, baseVersion);
-            }
+            oldContent = await oldTask;
         }
         catch
         {
-            // A rename or copy leaves no file at this path in the merge base.
-            // Treating it as an addition is correct and shows the whole new
-            // file, which is what a reviewer needs anyway.
+            // A copy, or a rename Azure DevOps reported without its old path,
+            // leaves no file at this path in the merge base. Treating it as an
+            // addition is correct and shows the whole new file, which is what
+            // a reviewer needs anyway.
             oldContent = "";
         }
 
@@ -392,15 +466,23 @@ public class AzureDevOpsService
             return DiffBuilder.DiffResult.Failed("binary content");
         }
 
-        return DiffBuilder.Build(oldContent, newContent, reviewSettings);
+        return DiffBuilder.Build(oldContent, newContent, _reviewSettings);
     }
 
-    private static async Task<string> ReadStreamAsync(
+    private async Task<string> ReadStreamAsync(
         GitHttpClient gitClient, string repoId, string filePath, GitVersionDescriptor version)
     {
-        using Stream stream = await gitClient.GetItemContentAsync(repoId, filePath, versionDescriptor: version);
-        using StreamReader reader = new(stream);
-        return await reader.ReadToEndAsync();
+        await _readGate.WaitAsync();
+        try
+        {
+            using Stream stream = await gitClient.GetItemContentAsync(repoId, filePath, versionDescriptor: version);
+            using StreamReader reader = new(stream);
+            return await reader.ReadToEndAsync();
+        }
+        finally
+        {
+            _readGate.Release();
+        }
     }
 
     private async Task<Guid> GetCurrentUserIdAsync()

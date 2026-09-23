@@ -34,7 +34,8 @@ public sealed class PullRequestReviewer
         Action<IReadOnlyList<BatchInfo>>? onBatchesPlanned = null,
         Action<int, bool>? onBatchCompleted = null)
     {
-        List<IReadOnlyList<ChangedFile>> batches = SplitIntoBatches(pr.ChangedFiles);
+        List<IReadOnlyList<ChangedFile>> batches = BatchPlanner.Split(
+            pr.ChangedFiles, _settings.MaxFilesPerRequest, _settings.MaxDiffCharsPerRequest);
 
         // Tell the caller the shape of the work before any of it starts, so a
         // live display can lay out one row per batch.
@@ -68,6 +69,11 @@ public sealed class PullRequestReviewer
                     ? null
                     : new BatchStampedProgress(liveProgress, index);
 
+                // Marks the batch as sent. Until the first token arrives the
+                // display would otherwise show it as still queued, which looks
+                // the same as a request stuck waiting on the provider.
+                batchProgress?.Report(new ReviewProgress(index, 0, 0, null, IsAnswer: false));
+
                 results[index] = await _reviewService.ReviewPullRequestAsync(
                     pr, batch, batchProgress);
             }
@@ -91,58 +97,23 @@ public sealed class PullRequestReviewer
             }
         }
 
-        int start = 0;
+        BatchSchedule schedule = BatchPlanner.Schedule(batches, _settings.WarmPrefixCache);
 
         // The first request populates the provider's prompt cache with the
         // prefix every other batch repeats; the rest then read it cheaply.
-        if (_settings.WarmPrefixCache && batches.Count > 1)
+        if (schedule.WarmUpIndex is int warmUp)
         {
-            await RunAsync(batches[0], 0, alone: true);
-            start = 1;
+            await RunAsync(batches[warmUp], warmUp, alone: true);
         }
 
-        await Task.WhenAll(batches.Skip(start)
-            .Select((batch, offset) => RunAsync(batch, start + offset, alone: false)));
+        // Started in schedule order. The gate releases waiters first come,
+        // first served, so this is also the order in which they get a slot.
+        await Task.WhenAll(schedule.Order.Select(i => RunAsync(batches[i], i, alone: false)));
 
         List<ReviewComment> comments = [.. results.Where(r => r is not null).SelectMany(r => r!)];
         List<BatchFailure> failures = [.. batchFailures.Where(f => f is not null).Select(f => f!)];
 
         return new PullRequestReviewResult(comments, failures, batches.Count);
-    }
-
-    // Packs files into batches bounded by both file count and diff size, so one
-    // enormous file cannot smuggle a whole batch's worth of tokens through a
-    // count-based limit. A file larger than the character budget on its own
-    // still gets a batch to itself rather than being dropped.
-    private List<IReadOnlyList<ChangedFile>> SplitIntoBatches(List<ChangedFile> files)
-    {
-        List<IReadOnlyList<ChangedFile>> batches = [];
-        List<ChangedFile> current = [];
-        int currentChars = 0;
-
-        foreach (ChangedFile file in files)
-        {
-            int size = file.Diff.Length;
-            bool wouldOverflow = current.Count >= _settings.MaxFilesPerRequest
-                || (current.Count != 0 && currentChars + size > _settings.MaxDiffCharsPerRequest);
-
-            if (wouldOverflow)
-            {
-                batches.Add(current);
-                current = [];
-                currentChars = 0;
-            }
-
-            current.Add(file);
-            currentChars += size;
-        }
-
-        if (current.Count != 0)
-        {
-            batches.Add(current);
-        }
-
-        return batches;
     }
 }
 

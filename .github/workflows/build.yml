@@ -28,3 +28,6 @@ jobs:
 
       - name: Build
         run: dotnet build PrReviewBot.slnx --configuration Release --no-restore
+
+      - name: Test
+        run: dotnet test PrReviewBot.slnx --configuration Release --no-build
